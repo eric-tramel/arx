@@ -1,18 +1,17 @@
+mod mcp_server;
+mod setup;
+
 use anyhow::{Context, Result};
-use arx::{
-    arxiv::{ArxivFetcher, FetchPaperRequest},
-    mcp_server::ArxMcpServer,
-    paths::xdg_cache_root,
-    setup,
-};
+use arx_core::{arxiv::ArxivFetcher, paths::xdg_cache_root};
 use clap::{Parser, Subcommand};
+use mcp_server::ArxMcpServer;
 use rmcp::{ServiceExt, transport::stdio};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "arx")]
-#[command(about = "Cached arXiv fetcher exposed as a stdio MCP server")]
+#[command(name = "arx-mcp")]
+#[command(about = "Stdio MCP server for cached arXiv paper retrieval")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -22,16 +21,6 @@ struct Cli {
 enum Command {
     #[command(about = "Run the stdio MCP server")]
     Serve,
-    #[command(about = "Fetch a paper directly and print the same JSON returned by the MCP tool")]
-    Fetch {
-        arxiv_id: String,
-        #[arg(long, default_value_t = true)]
-        include_pdf: bool,
-        #[arg(long, default_value_t = true)]
-        include_source: bool,
-        #[arg(long, default_value_t = false)]
-        refresh: bool,
-    },
     #[command(about = "Print the XDG cache directory used by arx")]
     CacheDir,
     #[command(about = "Print an MCP configuration snippet that launches this binary over stdio")]
@@ -48,24 +37,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => run_server().await,
-        Command::Fetch {
-            arxiv_id,
-            include_pdf,
-            include_source,
-            refresh,
-        } => {
-            let fetcher = ArxivFetcher::new(xdg_cache_root()?)?;
-            let response = fetcher
-                .fetch(FetchPaperRequest {
-                    arxiv_id,
-                    include_pdf: Some(include_pdf),
-                    include_source: Some(include_source),
-                    refresh: Some(refresh),
-                })
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
-            Ok(())
-        }
         Command::CacheDir => {
             println!("{}", xdg_cache_root()?.display());
             Ok(())

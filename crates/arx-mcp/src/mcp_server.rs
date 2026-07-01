@@ -1,4 +1,4 @@
-use crate::arxiv::{
+use arx_core::arxiv::{
     ArxivFetcher, FetchPaperRequest, FetchPaperResponse, LocatePaperRequest, LocatePaperResponse,
 };
 use rmcp::{

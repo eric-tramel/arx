@@ -1,0 +1,26 @@
+[package]
+name = "arx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core arXiv caching and citation extraction library for arx"
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+roxmltree.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

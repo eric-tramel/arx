@@ -1,0 +1,18 @@
+[package]
+name = "arx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone CLI for cached arXiv paper retrieval"
+
+[[bin]]
+name = "arx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arx-core = { path = "../arx-core" }
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
