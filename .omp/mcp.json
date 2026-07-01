@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "arx": {
+      "type": "stdio",
+      "command": "/Users/eric/src/arx/target/debug/arx-mcp",
+      "args": ["serve"],
+      "cwd": "/Users/eric/src/arx",
+      "env": {
+        "ARXD_BIN": "/Users/eric/src/arx/target/debug/arxd"
+      },
+      "timeout": 120000
+    }
+  }
+}

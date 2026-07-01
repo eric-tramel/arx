@@ -49,13 +49,18 @@ impl RateLimiter {
             tokio::time::sleep(wait).await;
         }
 
+        let mark_result = guard.mark_started();
+        if let Err(error) = mark_result {
+            return Err(error);
+        }
+
         let result = request().await;
-        let mark_result = guard.mark_completed();
-        match (result, mark_result) {
+        let release_result = guard.release();
+        match (result, release_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(err)) => Err(err),
             (Err(err), Ok(())) => Err(err),
-            (Err(err), Err(mark_err)) => Err(err.context(mark_err)),
+            (Err(err), Err(release_err)) => Err(err.context(release_err)),
         }
     }
 
@@ -110,7 +115,7 @@ impl RateLimitGuard {
         })
     }
 
-    fn mark_completed(mut self) -> Result<()> {
+    fn mark_started(&self) -> Result<()> {
         let now = unix_ms()?;
         let next_allowed_unix_ms = now.saturating_add(self.delay.as_millis() as u64);
         write_state(
@@ -118,7 +123,10 @@ impl RateLimitGuard {
             &RateLimitState {
                 next_allowed_unix_ms,
             },
-        )?;
+        )
+    }
+
+    fn release(mut self) -> Result<()> {
         self.file.unlock().context("unlocking rate-limit file")?;
         self.released = true;
         Ok(())
@@ -177,7 +185,14 @@ fn unix_ms() -> Result<u64> {
 mod tests {
     use super::*;
     use fs2::FileExt;
-    use std::{fs::OpenOptions, time::Duration};
+    use std::{
+        fs::OpenOptions,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -201,29 +216,53 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn guard_holds_lock_until_completion_and_writes_state_file() -> Result<()> {
+    #[tokio::test]
+    async fn run_records_next_allowed_at_request_start_and_holds_lock_until_request_finishes()
+    -> Result<()> {
         let temp = tempdir()?;
-        let limiter = RateLimiter::with_delay(temp.path(), Duration::from_millis(5));
-        let before = unix_ms()?;
+        let delay = Duration::from_millis(250);
+        let limiter = RateLimiter::with_delay(temp.path(), delay);
+        let request_started_no_earlier_than = unix_ms()?;
+        let lock_path = limiter.lock_path.clone();
+        let state_path = limiter.state_path.clone();
+        let next_allowed_during_request = Arc::new(AtomicU64::new(0));
+        let observed_next_allowed = next_allowed_during_request.clone();
 
-        let guard = RateLimitGuard::acquire(
-            limiter.lock_path.clone(),
-            limiter.state_path.clone(),
-            Duration::from_millis(5),
-        )?;
+        limiter
+            .run(|| async {
+                let state = read_state(&state_path)?;
+                observed_next_allowed.store(state.next_allowed_unix_ms, Ordering::SeqCst);
+                assert!(
+                    state.next_allowed_unix_ms
+                        >= request_started_no_earlier_than
+                            .saturating_add(delay.as_millis() as u64),
+                    "rate limiter should record the next allowed start before the request future completes"
+                );
+
+                let competing_lock = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)?;
+                assert!(
+                    competing_lock.try_lock_exclusive().is_err(),
+                    "rate limiter should keep the connection lock held while the request future runs"
+                );
+                Ok(())
+            })
+            .await?;
+
+        let state_after_completion = read_state(&limiter.state_path)?;
+        assert_eq!(
+            state_after_completion.next_allowed_unix_ms,
+            next_allowed_during_request.load(Ordering::SeqCst),
+            "request completion should not move the next allowed start later"
+        );
         let competing_lock = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&limiter.lock_path)?;
-        assert!(competing_lock.try_lock_exclusive().is_err());
-
-        guard.mark_completed()?;
-
         competing_lock.try_lock_exclusive()?;
         competing_lock.unlock()?;
-        let state = read_state(&limiter.state_path)?;
-        assert!(state.next_allowed_unix_ms >= before);
         assert!(limiter.lock_path.exists());
         assert!(limiter.state_path.exists());
         Ok(())

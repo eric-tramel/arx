@@ -68,6 +68,7 @@ jobs:
           mkdir -p "${staging}"
           cp target/release/arx "${staging}/"
           cp target/release/arx-mcp "${staging}/"
+          cp target/release/arxd "${staging}/"
           cp README.md LICENSE "${staging}/"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
           shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
@@ -80,6 +81,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item target/release/arx.exe "$staging/"
           Copy-Item target/release/arx-mcp.exe "$staging/"
+          Copy-Item target/release/arxd.exe "$staging/"
           Copy-Item README.md "$staging/"
           Copy-Item LICENSE "$staging/"
           Compress-Archive -Path "$staging/*" -DestinationPath "dist/$package.zip" -Force
@@ -117,4 +119,4 @@ jobs:
           gh release create "$TAG_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG_NAME" \
-            --notes "Prebuilt arx and arx-mcp binaries for Linux x86_64, macOS arm64, and Windows x86_64."
+            --notes "Prebuilt arx, arxd, and arx-mcp binaries for Linux x86_64, macOS arm64, and Windows x86_64."

@@ -44,8 +44,9 @@ mkdir -p "$install_dir"
 binary_root="$tmp_dir/arx-${target}"
 install -m 0755 "$binary_root/arx" "$install_dir/arx"
 install -m 0755 "$binary_root/arx-mcp" "$install_dir/arx-mcp"
+install -m 0755 "$binary_root/arxd" "$install_dir/arxd"
 
-echo "Installed arx and arx-mcp to $install_dir"
+echo "Installed arx, arxd, and arx-mcp to $install_dir"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) echo "Add $install_dir to PATH if it is not already available." ;;

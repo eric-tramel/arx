@@ -1,38 +1,48 @@
 # arx
 
-`arx` is a local arXiv cache with two separately runnable surfaces:
+`arx` is a local arXiv cache with a daemon-backed architecture:
 
-- `arx`: a standalone core CLI for fetching, locating, and inspecting cached arXiv papers without any agent or MCP runtime.
-- `arx-mcp`: a stdio MCP server that exposes the same core fetcher to agents.
+- `arxd`: the single local backend daemon. It owns the download queue, metadata indexing, SQLite writes, and arXiv rate limiting. If it is not running, frontends start it; when its queue is idle it shuts down after a short grace period.
+- `arx`: a standalone CLI frontend for queuing downloads, indexing cached metadata, locating cached files, and inspecting daemon status.
+- `arx-mcp`: a stdio MCP frontend that exposes the same daemon-backed operations to agents.
 
-The shared core downloads arXiv metadata, PDF, and TeX/source files into an XDG cache and records arXiv-to-arXiv citations discovered in the source as JSONL.
+The shared core downloads arXiv metadata, PDF, and TeX/source files into an XDG cache, records arXiv-to-arXiv citations discovered in the source as JSONL, and stores indexed metadata in a SQLite database under the cache root.
 
-The cache is safe for multi-agent use on one machine: arXiv network requests are serialized through a shared filesystem lock and a shared rate-limit state file, so separate CLI and MCP server processes respect the same delay.
+The cache is safe for multi-agent use on one machine: arxd is the only queue manager for a cache root, and arXiv network requests are serialized through the existing shared filesystem lock and rate-limit state.
 
 ## Workspace layout
 
 ```text
 crates/
-  arx-core/  # arXiv fetching, cache paths, source extraction, citations, rate limiting
-  arx-cli/   # standalone `arx` binary; no MCP dependency
-  arx-mcp/   # stdio `arx-mcp` MCP server and MCP setup helpers
+  arx-core/  # arXiv fetching, cache paths, daemon protocol, source extraction, citations, rate limiting
+  arxd/      # local backend daemon; owns queue and metadata database updates
+  arx-cli/   # standalone `arx` frontend; boots arxd when needed
+  arx-mcp/   # stdio `arx-mcp` MCP frontend and MCP setup helpers
 ```
 
 ## Features
 
 - Standalone CLI:
   - `arx fetch <ID>`
+  - `arx index`
   - `arx locate <ID>`
   - `arx cache-dir`
-- MCP stdio server with two tools:
-  - `fetch_arxiv_paper`: download/cache a paper and return paths.
+  - `arx queue-status`
+- Local backend daemon:
+  - `arxd serve`: owns the per-cache-root queue and database updates; frontends start it automatically.
+- MCP stdio server with four tools:
+  - `index_cached_arxiv_metadata`: ask arxd to index cached metadata without network access.
+  - `fetch_arxiv_paper`: ask arxd to queue/cache a paper and return a job id immediately.
+  - `get_arxiv_download_queue_status`: inspect queued, active, completed, and failed downloads.
   - `locate_cached_arxiv_paper`: return cached paths without network access.
 - Downloads arXiv metadata, PDF, and source/e-print bundle.
 - Extracts source archives when possible.
 - Writes arXiv-to-arXiv citations discovered in source/BibTeX files to `citations.jsonl`.
 - Caches under XDG cache directories for future hits.
+- Stores indexed metadata in `<cache-root>/metadata.sqlite3`.
+- Keeps arxd connection state in `<cache-root>/arxd.json` and the daemon singleton lock in `<cache-root>/arxd.lock`.
 - Enforces a cross-process 3 second delay between arXiv requests.
-- Includes MCP setup helpers in `arx-mcp` so harnesses can launch the server directly from config.
+- Includes MCP setup helpers in `arx-mcp` so harnesses can launch the frontend directly from config.
 
 ## Install
 
@@ -62,11 +72,12 @@ $env:ARX_INSTALL_DIR = "$HOME\\bin"
 .\\install.ps1
 ```
 
-Install both binaries from a checkout instead:
+Install all binaries from a checkout instead:
 
 ```bash
 cargo install --path crates/arx-cli
 cargo install --path crates/arx-mcp
+cargo install --path crates/arxd
 ```
 
 Or run from the workspace:
@@ -76,14 +87,60 @@ cargo run -p arx -- fetch 0704.0001
 cargo run -p arx-mcp -- serve
 ```
 
-`arx-mcp serve` is the default MCP command, so an MCP client can launch `arx-mcp` with no arguments or with `serve`.
+`arx-mcp serve` is the default MCP command, so an MCP client can launch `arx-mcp` with no arguments or with `serve`. `arx-mcp` starts `arxd` when a tool needs daemon work.
 
 ## Standalone CLI usage
 
-Fetch a paper outside MCP:
+Claim metadata/status first. `lookup` never downloads PDF/source material; by default it fetches only missing Atom metadata and returns local readiness for PDF/source/citations/search material.
+
+```bash
+arx lookup 0704.0001
+arx lookup 0704.0001 0704.0002
+arx lookup 0704.0001 --local-only
+```
+
+Fetch a paper outside MCP. By default this is interactive: it waits for arxd to finish, shows progress, then prints a human-readable summary.
 
 ```bash
 arx fetch 0704.0001
+```
+
+Fetch multiple papers in one command:
+
+```bash
+arx fetch 0704.0001 0704.0002 hep-th/9901001
+```
+
+Queue and return immediately:
+
+```bash
+arx fetch 0704.0001 --detach
+arx fetch 0704.0001 -d
+arx fetch 0704.0001 0704.0002 --detach
+```
+
+Check daemon queue status:
+
+```bash
+arx queue-status
+arx queue-status --job-id download-1
+```
+
+Machine-readable output is opt-in with `--json`/`-j`:
+
+```bash
+arx --json lookup 0704.0001
+arx --json lookup 0704.0001 --local-only
+arx --json fetch 0704.0001
+arx -j fetch 0704.0001 --detach
+arx -j fetch 0704.0001 0704.0002 --detach
+arx --json queue-status --job-id download-1
+```
+
+Index cached metadata into the local database:
+
+```bash
+arx index
 ```
 
 Locate cached files without network access:
@@ -111,22 +168,45 @@ arx fetch 0704.0001 --include-pdf=false
 arx fetch 0704.0001 --include-source=false
 ```
 
-Fetch output is structured JSON:
+JSON fetch output depends on mode. Blocking JSON mode prints the final fetched paper response after arxd completes:
 
 ```json
 {
   "arxiv_id": "0704.0001",
   "cache_dir": "/home/user/.cache/arx/papers/0704.0001",
   "metadata_path": "/home/user/.cache/arx/papers/0704.0001/metadata.json",
+  "metadata_db_path": "/home/user/.cache/arx/metadata.sqlite3",
+  "indexed_metadata_records": 12,
   "pdf_path": "/home/user/.cache/arx/papers/0704.0001/paper.pdf",
   "source_archive_path": "/home/user/.cache/arx/papers/0704.0001/source/e-print.tar.gz",
   "source_extracted_dir": "/home/user/.cache/arx/papers/0704.0001/source/extracted",
   "citations_jsonl_path": "/home/user/.cache/arx/papers/0704.0001/citations.jsonl",
+  "title": "A cached arXiv paper",
+  "authors": ["A. Author"],
+  "citation_count": 5,
   "cache_hit": false,
   "network_requests": 3,
   "rate_limit_delay_seconds": 3
 }
 ```
+
+Detached JSON mode prints the queued daemon job:
+
+```json
+{
+  "job_id": "download-1",
+  "arxiv_id": "0704.0001",
+  "status": "queued",
+  "queue_position": 1,
+  "queued_at_unix_ms": 1782864000000,
+  "estimated_seconds_until_start": 0,
+  "estimated_seconds_remaining": 9,
+  "status_tool": "get_arxiv_download_queue_status",
+  "message": "queued arXiv download; call get_arxiv_download_queue_status with this job_id to check progress"
+}
+```
+
+When more than one arXiv id is requested with `--json`, fetch and lookup output are JSON arrays in the same order as the requested ids. `lookup` entries are metadata-first paper objects with per-paper `material_state`, cached `metadata` when available, `available_now`, `missing`, and a `next_tool` hint.
 
 ## MCP usage
 
@@ -135,6 +215,8 @@ Run the MCP server directly:
 ```bash
 arx-mcp serve
 ```
+
+The MCP server is metadata-first. Start with `lookup_arxiv_papers` to get a stable local paper object, cached metadata/abstract, and explicit material readiness without fetching PDF/source. Use `get_arxiv_material_status` for local-only readiness, `search_arxiv_material` for local snippets from cached metadata/citations/extracted source, `prepare_arxiv_material` to queue PDF/source acquisition, and `get_arxiv_download_queue_status` to inspect daemon jobs. `fetch_arxiv_paper` remains as a compatibility alias for queuing downloads. `index_cached_arxiv_metadata` mirrors `arx index`.
 
 Print a ready-to-copy MCP config snippet:
 
@@ -174,6 +256,21 @@ Cache root resolution:
 1. `$ARX_CACHE_DIR`, when set.
 2. `$XDG_CACHE_HOME/arx`, when set.
 3. `~/.cache/arx`.
+
+The metadata index database is stored at:
+
+```text
+<cache-root>/metadata.sqlite3
+```
+
+Run `arx index` to ask arxd to scan existing `metadata.json` files into the database. `arx fetch` queues the fetch in arxd and, unless `--detach` is passed, waits while showing interactive progress. arxd runs the same index step before fetching a paper, then writes the fetched paper's metadata into the database.
+
+arxd state files live at:
+
+```text
+<cache-root>/arxd.json
+<cache-root>/arxd.lock
+```
 
 Paper files are stored under:
 
@@ -226,7 +323,7 @@ GitHub Actions builds release binaries on every push to `main` and every `v*` ve
 
 Pushes to `main` produce workflow artifacts for verification. Version tags publish the same archives and `.sha256` files to GitHub Releases.
 
-Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` bootstrap installers. This keeps install friction low across Linux/macOS/Windows without adding package-manager infrastructure before there is demand. Homebrew/Scoop/cargo-dist can be layered on later using the same release archives.
+Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` bootstrap installers. Release archives include `arx`, `arxd`, and `arx-mcp` together so frontends can boot the daemon from the same install directory. Homebrew/Scoop/cargo-dist can be layered on later using the same release archives.
 
 Create a release:
 
@@ -242,6 +339,7 @@ cargo fmt
 cargo test --workspace
 cargo run -p arx -- locate 0704.0001
 cargo run -p arx-mcp -- print-config
+cargo run -p arxd -- serve
 ```
 
 MCP smoke testing can be done with any MCP client that supports stdio servers, or by using the generated config from `arx-mcp print-config`.

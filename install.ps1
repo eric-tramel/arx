@@ -36,8 +36,9 @@ try {
     $BinaryRoot = Join-Path $TempDir "arx-$Target"
     Copy-Item (Join-Path $BinaryRoot "arx.exe") (Join-Path $InstallDir "arx.exe") -Force
     Copy-Item (Join-Path $BinaryRoot "arx-mcp.exe") (Join-Path $InstallDir "arx-mcp.exe") -Force
+    Copy-Item (Join-Path $BinaryRoot "arxd.exe") (Join-Path $InstallDir "arxd.exe") -Force
 
-    Write-Host "Installed arx and arx-mcp to $InstallDir"
+    Write-Host "Installed arx, arxd, and arx-mcp to $InstallDir"
     $PathEntries = [Environment]::GetEnvironmentVariable("PATH", "User") -split ";"
     if ($PathEntries -notcontains $InstallDir) {
         Write-Host "Add $InstallDir to your user PATH if it is not already available."

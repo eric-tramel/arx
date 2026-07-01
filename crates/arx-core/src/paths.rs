@@ -41,6 +41,18 @@ pub fn paper_cache_dir(cache_root: impl Into<PathBuf>, arxiv_id: &str) -> PathBu
         .join(safe_arxiv_id(arxiv_id))
 }
 
+pub fn metadata_db_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+    cache_root.as_ref().join("metadata.sqlite3")
+}
+
+pub fn arxd_state_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+    cache_root.as_ref().join("arxd.json")
+}
+
+pub fn arxd_lock_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+    cache_root.as_ref().join("arxd.lock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +70,8 @@ mod tests {
             root.join("papers")
                 .join("https___arxiv.org_abs_2401.12345v2")
         );
+        assert_eq!(metadata_db_path(&root), root.join("metadata.sqlite3"));
+        assert_eq!(arxd_state_path(&root), root.join("arxd.json"));
+        assert_eq!(arxd_lock_path(&root), root.join("arxd.lock"));
     }
 }
