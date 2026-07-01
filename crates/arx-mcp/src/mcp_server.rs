@@ -2,7 +2,7 @@ use arx_core::{
     arxiv::{
         ArxivFetcher, FetchPaperRequest, LocatePaperRequest, LocatePaperResponse,
         LookupPapersRequest, LookupPapersResponse, MaterialStatusRequest, PaperMaterialStatus,
-        SearchMaterialRequest, SearchMaterialResponse,
+        SearchCorpusRequest, SearchCorpusResponse, SearchMaterialRequest, SearchMaterialResponse,
     },
     daemon::{
         ArxdClient, DownloadQueueStatusRequest, DownloadQueueStatusResponse, QueuedFetchResponse,
@@ -68,7 +68,7 @@ impl ArxMcpServer {
 
     #[tool(
         name = "search_arxiv_material",
-        description = "Search only local cached arXiv material for a paper. It searches cached metadata/abstract, citations JSONL, and extracted TeX/source text, returning snippets with source paths and line numbers. This never contacts arXiv."
+        description = "Search only local cached arXiv material for a paper. It runs BM25-ranked free-text search over cached metadata/abstract, citations JSONL, and extracted TeX/source paragraphs, returning best-first snippets with scores, source paths, and line ranges. This never contacts arXiv."
     )]
     pub fn search_arxiv_material(
         &self,
@@ -126,8 +126,22 @@ impl ArxMcpServer {
     }
 
     #[tool(
+        name = "search_arxiv_corpus",
+        description = "BM25-ranked free-text search across ALL locally cached arXiv papers at once, using the persistent FTS5 index over metadata, citations, and TeX/source paragraphs. Returns best-first snippets with arXiv ids, source paths, and line ranges. Optionally restrict to one paper with arxiv_id. This never contacts arXiv; run index_cached_arxiv_metadata first if results seem incomplete."
+    )]
+    pub fn search_arxiv_corpus(
+        &self,
+        Parameters(request): Parameters<SearchCorpusRequest>,
+    ) -> Result<Json<SearchCorpusResponse>, String> {
+        self.fetcher
+            .search_corpus(request)
+            .map(Json)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tool(
         name = "index_cached_arxiv_metadata",
-        description = "Ask arxd to scan cached arXiv metadata JSON files under the local XDG cache and upsert them into the cache SQLite metadata database. This never contacts arXiv."
+        description = "Ask arxd to scan cached arXiv metadata JSON files under the local XDG cache, upsert them into the cache SQLite metadata database, and rebuild the full-text material index used by search_arxiv_corpus. This never contacts arXiv."
     )]
     pub async fn index_cached_arxiv_metadata(&self) -> Result<Json<IndexReport>, String> {
         self.daemon_client
@@ -160,7 +174,7 @@ impl ServerHandler for ArxMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "arx MCP is a metadata-first frontend for local arXiv grounding. Start with lookup_arxiv_papers: it returns a stable paper object, cached metadata/abstract, local material readiness, and only fetches missing metadata by default. Use get_arxiv_material_status for local-only readiness checks and search_arxiv_material for local snippets with source paths/line numbers. Use prepare_arxiv_material or fetch_arxiv_paper only when PDF/source acquisition is explicitly needed; they queue arxd work and return a job id immediately. Use get_arxiv_download_queue_status to inspect queued, in-progress, completed, and failed jobs. Use index_cached_arxiv_metadata to rescan local metadata without network access. arxd enforces the cross-process arXiv request delay and shuts down after its queue is idle."
+                "arx MCP is a metadata-first frontend for local arXiv grounding. Start with lookup_arxiv_papers: it returns a stable paper object, cached metadata/abstract, local material readiness, and only fetches missing metadata by default. Use get_arxiv_material_status for local-only readiness checks, search_arxiv_material for BM25-ranked snippets within one paper, and search_arxiv_corpus for BM25-ranked search across every locally cached paper. Use prepare_arxiv_material or fetch_arxiv_paper only when PDF/source acquisition is explicitly needed; they queue arxd work and return a job id immediately. Use get_arxiv_download_queue_status to inspect queued, in-progress, completed, and failed jobs. Use index_cached_arxiv_metadata to rescan local metadata without network access. arxd enforces the cross-process arXiv request delay and shuts down after its queue is idle."
                     .to_string(),
             ),
         }

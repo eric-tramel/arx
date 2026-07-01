@@ -18,6 +18,7 @@ rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tantivy.workspace = true
 tar.workspace = true
 tokio.workspace = true
 tracing.workspace = true

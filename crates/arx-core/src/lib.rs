@@ -1,5 +1,7 @@
 pub mod arxiv;
 pub mod daemon;
+pub mod material_index;
 pub mod metadata_db;
 pub mod paths;
 pub mod rate_limit;
+pub mod search;

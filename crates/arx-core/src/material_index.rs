@@ -1,0 +1,418 @@
+//! Persistent Tantivy full-text index over cached paper material.
+//!
+//! The index lives at `<cache_root>/search-index/` and is derived data: it
+//! can always be rebuilt from the paper cache (`arx index`), so corruption
+//! or version mismatches are handled by wiping the directory and starting
+//! over rather than by migration.
+//!
+//! Process topology: arxd is the only writer (fetch-time incremental updates
+//! and full rebuilds), while arx-mcp and arx-cli open the index read-only per
+//! query. Tantivy enforces a single `IndexWriter` via a lock file that fails
+//! fast instead of waiting, so writer acquisition retries briefly to absorb
+//! races around arxd startup.
+
+use crate::paths;
+use anyhow::{Context, Result, bail};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+use tantivy::{
+    Index, IndexWriter, TantivyDocument, TantivyError, Term,
+    collector::TopDocs,
+    directory::MmapDirectory,
+    query::{BooleanQuery, Occur, Query, TermQuery},
+    schema::{Field, IndexRecordOption, STORED, STRING, Schema, TEXT, Value},
+    snippet::SnippetGenerator,
+};
+
+/// Bump to force existing indexes to be discarded and rebuilt (e.g. after a
+/// schema change or a tantivy upgrade that breaks the on-disk format).
+const MATERIAL_INDEX_VERSION: &str = "1";
+const VERSION_MARKER_FILE: &str = "arx-index-version";
+const WRITER_MEMORY_BYTES: usize = 50_000_000;
+const WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const WRITER_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+const SNIPPET_MAX_CHARS: usize = 400;
+
+/// One indexable unit of paper material: a metadata field, a citation
+/// record, or a paragraph of TeX/source text.
+#[derive(Debug, Clone)]
+pub struct MaterialChunk {
+    pub source: String,
+    pub field: Option<String>,
+    pub path: Option<String>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CorpusSearchResult {
+    pub arxiv_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line_start: Option<usize>,
+    #[serde(default)]
+    pub line_end: Option<usize>,
+    pub snippet: String,
+    #[schemars(description = "BM25 relevance score; results are sorted best-first.")]
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MaterialFields {
+    text: Field,
+    arxiv_id: Field,
+    source: Field,
+    field: Field,
+    path: Field,
+    line_start: Field,
+    line_end: Field,
+}
+
+fn material_schema() -> (Schema, MaterialFields) {
+    let mut builder = Schema::builder();
+    let fields = MaterialFields {
+        text: builder.add_text_field("text", TEXT | STORED),
+        arxiv_id: builder.add_text_field("arxiv_id", STRING | STORED),
+        source: builder.add_text_field("source", STORED),
+        field: builder.add_text_field("field", STORED),
+        path: builder.add_text_field("path", STORED),
+        line_start: builder.add_u64_field("line_start", STORED),
+        line_end: builder.add_u64_field("line_end", STORED),
+    };
+    (builder.build(), fields)
+}
+
+#[derive(Clone)]
+pub struct MaterialIndex {
+    index: Index,
+    fields: MaterialFields,
+}
+
+impl MaterialIndex {
+    pub fn open_or_create(cache_root: impl AsRef<Path>) -> Result<Self> {
+        let dir = paths::search_index_dir(cache_root);
+        match Self::try_open(&dir) {
+            Ok(index) => Ok(index),
+            Err(_) => {
+                // The index is derived data; on version mismatch or
+                // corruption, discard and start empty. `arx index` rebuilds.
+                if dir.exists() {
+                    fs::remove_dir_all(&dir).with_context(|| {
+                        format!("clearing stale search index {}", dir.display())
+                    })?;
+                }
+                Self::try_open(&dir)
+            }
+        }
+    }
+
+    fn try_open(dir: &PathBuf) -> Result<Self> {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("creating search index directory {}", dir.display()))?;
+        let marker = dir.join(VERSION_MARKER_FILE);
+        if marker.exists() {
+            let version = fs::read_to_string(&marker)
+                .with_context(|| format!("reading {}", marker.display()))?;
+            if version.trim() != MATERIAL_INDEX_VERSION {
+                bail!(
+                    "search index version {} does not match expected {MATERIAL_INDEX_VERSION}",
+                    version.trim()
+                );
+            }
+        } else {
+            fs::write(&marker, MATERIAL_INDEX_VERSION)
+                .with_context(|| format!("writing {}", marker.display()))?;
+        }
+        let (schema, fields) = material_schema();
+        let directory = MmapDirectory::open(dir)
+            .with_context(|| format!("opening search index directory {}", dir.display()))?;
+        let index = Index::open_or_create(directory, schema)
+            .with_context(|| format!("opening search index {}", dir.display()))?;
+        Ok(Self { index, fields })
+    }
+
+    /// Replace all indexed chunks for one paper (delete-by-id then insert,
+    /// committed atomically from the reader's perspective).
+    pub fn replace_paper(&self, arxiv_id: &str, chunks: &[MaterialChunk]) -> Result<usize> {
+        let mut writer = self.writer()?;
+        writer.delete_term(Term::from_field_text(self.fields.arxiv_id, arxiv_id));
+        for chunk in chunks {
+            writer
+                .add_document(self.document(arxiv_id, chunk))
+                .context("adding material chunk to search index")?;
+        }
+        writer
+            .commit()
+            .context("committing material index update")?;
+        Ok(chunks.len())
+    }
+
+    /// Rebuild the whole index from scratch. Stale papers disappear because
+    /// only what is passed in survives.
+    pub fn rebuild(&self, papers: &[(String, Vec<MaterialChunk>)]) -> Result<usize> {
+        let mut writer = self.writer()?;
+        writer
+            .delete_all_documents()
+            .context("clearing search index for rebuild")?;
+        let mut total = 0;
+        for (arxiv_id, chunks) in papers {
+            for chunk in chunks {
+                writer
+                    .add_document(self.document(arxiv_id, chunk))
+                    .context("adding material chunk to search index")?;
+            }
+            total += chunks.len();
+        }
+        writer.commit().context("committing search index rebuild")?;
+        Ok(total)
+    }
+
+    /// BM25-ranked search, best first. `query_tokens` are OR-combined so
+    /// multi-term queries rank by relevance without requiring every term;
+    /// `arxiv_id` optionally restricts results to one paper.
+    pub fn search(
+        &self,
+        query_tokens: &[String],
+        arxiv_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CorpusSearchResult>> {
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reader = self.index.reader().context("opening search index reader")?;
+        let searcher = reader.searcher();
+
+        let token_clauses: Vec<(Occur, Box<dyn Query>)> = query_tokens
+            .iter()
+            .map(|token| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.text, token),
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        let token_query = BooleanQuery::new(token_clauses);
+        let query: Box<dyn Query> = match arxiv_id {
+            Some(arxiv_id) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(token_query) as Box<dyn Query>),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.arxiv_id, arxiv_id),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ])),
+            None => Box::new(token_query),
+        };
+
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(limit).order_by_score())
+            .context("searching material index")?;
+        let mut snippets = SnippetGenerator::create(&searcher, &*query, self.fields.text)
+            .context("creating snippet generator")?;
+        snippets.set_max_num_chars(SNIPPET_MAX_CHARS);
+
+        top_docs
+            .into_iter()
+            .map(|(score, address)| {
+                let document: TantivyDocument = searcher
+                    .doc(address)
+                    .context("loading search index document")?;
+                Ok(self.to_result(&document, &snippets, score))
+            })
+            .collect()
+    }
+
+    pub fn chunk_count(&self) -> Result<u64> {
+        let reader = self.index.reader().context("opening search index reader")?;
+        Ok(reader.searcher().num_docs())
+    }
+
+    fn document(&self, arxiv_id: &str, chunk: &MaterialChunk) -> TantivyDocument {
+        let mut document = TantivyDocument::new();
+        document.add_text(self.fields.text, &chunk.text);
+        document.add_text(self.fields.arxiv_id, arxiv_id);
+        document.add_text(self.fields.source, &chunk.source);
+        if let Some(field) = &chunk.field {
+            document.add_text(self.fields.field, field);
+        }
+        if let Some(path) = &chunk.path {
+            document.add_text(self.fields.path, path);
+        }
+        if let Some(line) = chunk.line_start {
+            document.add_u64(self.fields.line_start, line as u64);
+        }
+        if let Some(line) = chunk.line_end {
+            document.add_u64(self.fields.line_end, line as u64);
+        }
+        document
+    }
+
+    fn to_result(
+        &self,
+        document: &TantivyDocument,
+        snippets: &SnippetGenerator,
+        score: f32,
+    ) -> CorpusSearchResult {
+        let text_field = |field: Field| {
+            document
+                .get_first(field)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let line_field = |field: Field| {
+            document
+                .get_first(field)
+                .and_then(|value| value.as_u64())
+                .map(|line| line as usize)
+        };
+        let fragment = snippets.snippet_from_doc(document).fragment().to_string();
+        let snippet = if fragment.trim().is_empty() {
+            truncate_chars(
+                &text_field(self.fields.text).unwrap_or_default(),
+                SNIPPET_MAX_CHARS,
+            )
+        } else {
+            clean_ws(&fragment)
+        };
+        CorpusSearchResult {
+            arxiv_id: text_field(self.fields.arxiv_id).unwrap_or_default(),
+            source: text_field(self.fields.source).unwrap_or_default(),
+            field: text_field(self.fields.field),
+            path: text_field(self.fields.path),
+            line_start: line_field(self.fields.line_start),
+            line_end: line_field(self.fields.line_end),
+            snippet,
+            score: round_score(score as f64),
+        }
+    }
+
+    /// Tantivy's writer lock fails fast (no SQLite-style busy timeout), so
+    /// retry briefly; arxd is the designed single writer and contention only
+    /// occurs around process races.
+    fn writer(&self) -> Result<IndexWriter> {
+        let start = Instant::now();
+        loop {
+            match self.index.writer(WRITER_MEMORY_BYTES) {
+                Ok(writer) => return Ok(writer),
+                Err(TantivyError::LockFailure(..)) if start.elapsed() < WRITER_LOCK_TIMEOUT => {
+                    std::thread::sleep(WRITER_LOCK_RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(error).context("acquiring search index writer lock");
+                }
+            }
+        }
+    }
+}
+
+fn clean_ws(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let cleaned = clean_ws(value);
+    if cleaned.chars().count() <= max_chars {
+        cleaned
+    } else {
+        let truncated: String = cleaned.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
+}
+
+fn round_score(score: f64) -> f64 {
+    (score * 1e4).round() / 1e4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn chunk(text: &str) -> MaterialChunk {
+        MaterialChunk {
+            source: "source".to_string(),
+            field: None,
+            path: Some("main.tex".to_string()),
+            line_start: Some(1),
+            line_end: Some(2),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn replace_paper_is_idempotent_and_searchable() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper("2401.11111", &[chunk("stochastic gradient descent")])?;
+        index.replace_paper("2401.11111", &[chunk("stochastic gradient descent")])?;
+        assert_eq!(index.chunk_count()?, 1);
+
+        let results = index.search(&["stochastic".to_string()], None, 10)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].arxiv_id, "2401.11111");
+        assert_eq!(results[0].line_start, Some(1));
+        assert!(results[0].score > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn search_filters_by_arxiv_id() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper("2401.11111", &[chunk("attention transformers")])?;
+        index.replace_paper("2401.22222", &[chunk("attention mechanisms everywhere")])?;
+
+        let all = index.search(&["attention".to_string()], None, 10)?;
+        assert_eq!(all.len(), 2);
+        let filtered = index.search(&["attention".to_string()], Some("2401.22222"), 10)?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].arxiv_id, "2401.22222");
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_drops_papers_not_passed_in() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper("2401.11111", &[chunk("calibration")])?;
+        index.rebuild(&[("2401.22222".to_string(), vec![chunk("transformers")])])?;
+        assert_eq!(index.chunk_count()?, 1);
+        assert!(
+            index
+                .search(&["calibration".to_string()], None, 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_mismatch_wipes_and_recreates_index() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper("2401.11111", &[chunk("calibration")])?;
+        drop(index);
+
+        fs::write(
+            paths::search_index_dir(temp.path()).join(VERSION_MARKER_FILE),
+            "0",
+        )?;
+        let reopened = MaterialIndex::open_or_create(temp.path())?;
+        assert_eq!(reopened.chunk_count()?, 0);
+        Ok(())
+    }
+}

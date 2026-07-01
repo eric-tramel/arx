@@ -22,6 +22,8 @@ pub struct IndexReport {
     pub scanned_metadata_files: usize,
     pub indexed_papers: usize,
     pub removed_papers: usize,
+    #[serde(default)]
+    pub indexed_material_chunks: usize,
 }
 
 impl MetadataDatabase {
@@ -97,6 +99,7 @@ impl MetadataDatabase {
             scanned_metadata_files,
             indexed_papers,
             removed_papers,
+            indexed_material_chunks: 0,
         })
     }
 
@@ -163,13 +166,17 @@ fn migrate(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published);
             CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated);
             CREATE INDEX IF NOT EXISTS papers_title_idx ON papers(title);
+            -- Full-text material search moved to the Tantivy index under
+            -- <cache_root>/search-index/; drop the FTS5 table left behind
+            -- by earlier versions.
+            DROP TABLE IF EXISTS material_fts;
             "#,
         )
         .context("migrating metadata database")?;
     Ok(())
 }
 
-fn metadata_files(cache_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn metadata_files(cache_root: &Path) -> Vec<PathBuf> {
     let papers_dir = cache_root.join("papers");
     if !papers_dir.exists() {
         return Vec::new();

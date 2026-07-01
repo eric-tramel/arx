@@ -137,10 +137,27 @@ arx -j fetch 0704.0001 0704.0002 --detach
 arx --json queue-status --job-id download-1
 ```
 
-Index cached metadata into the local database:
+Index cached metadata into the local database. This also rebuilds the
+persistent full-text search index (a [Tantivy](https://github.com/quickwit-oss/tantivy)
+index at `<cache-dir>/search-index/` covering metadata, citations, and
+TeX/source paragraphs) used by `arx search`:
 
 ```bash
 arx index
+```
+
+The search index is derived data: arx wipes and rebuilds it automatically
+on version mismatch or corruption, and `arx index` regenerates it from the
+paper cache at any time. arxd is the only writer; the CLI and MCP server
+open it read-only per query.
+
+BM25-ranked free-text search across all locally cached paper material,
+without network access:
+
+```bash
+arx search reward model training
+arx search "mixture of experts" --limit 5
+arx search calibration --arxiv-id 0704.0001
 ```
 
 Locate cached files without network access:
@@ -216,7 +233,7 @@ Run the MCP server directly:
 arx-mcp serve
 ```
 
-The MCP server is metadata-first. Start with `lookup_arxiv_papers` to get a stable local paper object, cached metadata/abstract, and explicit material readiness without fetching PDF/source. Use `get_arxiv_material_status` for local-only readiness, `search_arxiv_material` for local snippets from cached metadata/citations/extracted source, `prepare_arxiv_material` to queue PDF/source acquisition, and `get_arxiv_download_queue_status` to inspect daemon jobs. `fetch_arxiv_paper` remains as a compatibility alias for queuing downloads. `index_cached_arxiv_metadata` mirrors `arx index`.
+The MCP server is metadata-first. Start with `lookup_arxiv_papers` to get a stable local paper object, cached metadata/abstract, and explicit material readiness without fetching PDF/source. Use `get_arxiv_material_status` for local-only readiness, `search_arxiv_material` for BM25-ranked snippets within one paper's cached metadata/citations/extracted source, `search_arxiv_corpus` for BM25-ranked search across every locally cached paper, `prepare_arxiv_material` to queue PDF/source acquisition, and `get_arxiv_download_queue_status` to inspect daemon jobs. `fetch_arxiv_paper` remains as a compatibility alias for queuing downloads. `index_cached_arxiv_metadata` mirrors `arx index`.
 
 Print a ready-to-copy MCP config snippet:
 

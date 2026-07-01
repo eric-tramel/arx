@@ -3,7 +3,7 @@ use arx_core::{
     arxiv::{
         ArxivFetcher, FetchPaperRequest, FetchPaperResponse, LocatePaperRequest,
         LocatePaperResponse, LookupPapersRequest, LookupPapersResponse, MaterialState,
-        PaperMaterialStatus,
+        PaperMaterialStatus, SearchCorpusRequest, SearchCorpusResponse,
     },
     daemon::{
         ArxdClient, DownloadJobState, DownloadJobStatus, DownloadQueueStatusRequest,
@@ -68,6 +68,15 @@ enum Command {
     },
     #[command(about = "Index cached arXiv metadata into the local database")]
     Index,
+    #[command(about = "BM25 free-text search across all locally cached paper material")]
+    Search {
+        #[arg(value_name = "QUERY", required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long, help = "Restrict results to a single arXiv id")]
+        arxiv_id: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     #[command(about = "Show arxd download queue status")]
     QueueStatus {
         #[arg(long)]
@@ -161,6 +170,22 @@ async fn main() -> Result<()> {
                 print_json(&response)?;
             } else {
                 print_queue_status(&response);
+            }
+        }
+        Command::Search {
+            query,
+            arxiv_id,
+            limit,
+        } => {
+            let response = fetcher.search_corpus(SearchCorpusRequest {
+                query: query.join(" "),
+                arxiv_id,
+                limit: Some(limit),
+            })?;
+            if json {
+                print_json(&response)?;
+            } else {
+                print_search_response(&response);
             }
         }
         Command::Locate { arxiv_id } => {
@@ -401,12 +426,48 @@ fn print_index_report(report: &IndexReport) {
         report.scanned_metadata_files
     );
     print_field("database", Some(report.database_path.as_str()));
+    if report.indexed_material_chunks > 0 {
+        println!(
+            "{} indexed {} searchable material chunks",
+            green("done"),
+            report.indexed_material_chunks
+        );
+    }
     if report.removed_papers > 0 {
         println!(
             "{} removed {} stale rows",
             yellow("pruned:"),
             report.removed_papers
         );
+    }
+}
+
+fn print_search_response(response: &SearchCorpusResponse) {
+    if response.results.is_empty() {
+        println!(
+            "{} no matches in {} indexed chunks (run `arx index` to refresh the index)",
+            yellow("empty"),
+            response.indexed_chunks
+        );
+        return;
+    }
+    for result in &response.results {
+        let location = match (&result.path, result.line_start, result.line_end) {
+            (Some(path), Some(start), Some(end)) if start != end => {
+                format!("{path}:{start}-{end}")
+            }
+            (Some(path), Some(start), _) => format!("{path}:{start}"),
+            (Some(path), None, _) => path.clone(),
+            (None, _, _) => result.field.clone().unwrap_or_else(|| "-".to_string()),
+        };
+        println!(
+            "{:>8.2}  {}  {}  {}",
+            result.score,
+            cyan(&result.arxiv_id),
+            green(&result.source),
+            location
+        );
+        println!("          {}", result.snippet);
     }
 }
 

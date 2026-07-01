@@ -383,7 +383,7 @@ async fn handle_connection(
         ArxdRequest::QueueStatus { request } => ArxdResponse::QueueStatus {
             response: queue.status(request).await,
         },
-        ArxdRequest::Index => match fetcher.index() {
+        ArxdRequest::Index => match fetcher.index_with_material() {
             Ok(response) => ArxdResponse::Index { response },
             Err(error) => ArxdResponse::Error {
                 message: error.to_string(),

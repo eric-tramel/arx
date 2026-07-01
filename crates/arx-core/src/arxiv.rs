@@ -1,4 +1,5 @@
 use crate::{
+    material_index::{CorpusSearchResult, MaterialChunk, MaterialIndex},
     metadata_db::{IndexReport, MetadataDatabase},
     paths,
     rate_limit::RateLimiter,
@@ -241,6 +242,25 @@ pub struct SearchMaterialResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchCorpusRequest {
+    #[schemars(description = "Free-text query, BM25-ranked across all locally indexed papers.")]
+    pub query: String,
+    #[serde(default)]
+    #[schemars(description = "Optional arXiv id to restrict results to a single paper.")]
+    pub arxiv_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchCorpusResponse {
+    pub query: String,
+    #[schemars(description = "Total material chunks in the persistent index.")]
+    pub indexed_chunks: u64,
+    pub results: Vec<CorpusSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MaterialSearchResult {
     pub source: String,
     #[serde(default)]
@@ -252,6 +272,9 @@ pub struct MaterialSearchResult {
     #[serde(default)]
     pub line_end: Option<usize>,
     pub snippet: String,
+    #[serde(default)]
+    #[schemars(description = "BM25 relevance score; results are sorted best-first.")]
+    pub score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +346,74 @@ impl ArxivFetcher {
     }
 
     pub async fn fetch(&self, request: FetchPaperRequest) -> Result<FetchPaperResponse> {
+        let response = self.fetch_inner(request).await?;
+        if !response.cache_hit {
+            self.index_paper_material(&response.arxiv_id)?;
+        }
+        Ok(response)
+    }
+
+    /// Re-chunk one paper's cached material and replace its documents in
+    /// the persistent Tantivy index. Keyed by the metadata's canonical
+    /// arXiv id so fetch-time and rescan indexing converge on the same rows.
+    pub fn index_paper_material(&self, arxiv_id: &str) -> Result<usize> {
+        let arxiv_id = normalize_arxiv_id(arxiv_id)?;
+        let paths = PaperPaths::new(&self.cache_root, &arxiv_id);
+        let (canonical_id, chunks) = paper_material_for_index(&paths, &arxiv_id)?;
+        MaterialIndex::open_or_create(&self.cache_root)?.replace_paper(&canonical_id, &chunks)
+    }
+
+    /// Rescan cached metadata and rebuild the material index from scratch
+    /// for every cached paper; papers removed from the cache drop out of
+    /// the index. Heavier than `index`; runs on explicit reindex requests.
+    pub fn index_with_material(&self) -> Result<IndexReport> {
+        let mut report = self.index()?;
+        let mut papers = Vec::new();
+        for metadata_path in crate::metadata_db::metadata_files(&self.cache_root) {
+            let Some(cache_dir) = metadata_path.parent() else {
+                continue;
+            };
+            let paths = PaperPaths::from_cache_dir(cache_dir.to_path_buf());
+            let fallback_id = cache_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            papers.push(paper_material_for_index(&paths, &fallback_id)?);
+        }
+        report.indexed_material_chunks =
+            MaterialIndex::open_or_create(&self.cache_root)?.rebuild(&papers)?;
+        Ok(report)
+    }
+
+    /// BM25-ranked search across ALL locally indexed paper material via the
+    /// persistent Tantivy index under the cache root.
+    pub fn search_corpus(&self, request: SearchCorpusRequest) -> Result<SearchCorpusResponse> {
+        let query = request.query.trim();
+        if query.is_empty() {
+            bail!("search query must not be empty");
+        }
+        let query_tokens = crate::search::tokenize(query);
+        if query_tokens.is_empty() {
+            bail!("search query must contain at least one term of two or more characters");
+        }
+        let limit = request.limit.unwrap_or(20).clamp(1, 100);
+        let arxiv_id = request
+            .arxiv_id
+            .as_deref()
+            .map(normalize_arxiv_id)
+            .transpose()?
+            .map(|arxiv_id| base_arxiv_id(&arxiv_id));
+        let index = MaterialIndex::open_or_create(&self.cache_root)?;
+        let results = index.search(&query_tokens, arxiv_id.as_deref(), limit)?;
+        Ok(SearchCorpusResponse {
+            query: query.to_string(),
+            indexed_chunks: index.chunk_count()?,
+            results,
+        })
+    }
+
+    async fn fetch_inner(&self, request: FetchPaperRequest) -> Result<FetchPaperResponse> {
         let arxiv_id = normalize_arxiv_id(&request.arxiv_id)?;
         let options = FetchOptions::from(&request);
         let index_report = self.index()?;
@@ -596,20 +687,28 @@ impl ArxivFetcher {
         if query.is_empty() {
             bail!("search query must not be empty");
         }
+        let query_tokens = crate::search::tokenize(query);
+        if query_tokens.is_empty() {
+            bail!("search query must contain at least one term of two or more characters");
+        }
         let limit = request.limit.unwrap_or(20).clamp(1, 100);
         let status = self.status(MaterialStatusRequest {
             arxiv_id: arxiv_id.clone(),
         })?;
         let paths = PaperPaths::new(&self.cache_root, &arxiv_id);
-        let manifest = read_or_infer_manifest(&paths)?;
-        let mut results = Vec::new();
-        search_metadata(query, &status.metadata, limit, &mut results);
-        if results.len() < limit {
-            search_citations(query, &paths.citations_path, limit, &mut results)?;
-        }
-        if results.len() < limit {
-            search_source_material(query, &paths, manifest.as_ref(), limit, &mut results)?;
-        }
+        let candidates = collect_paper_material(&paths)?;
+
+        let documents: Vec<Vec<String>> = candidates
+            .iter()
+            .map(|candidate| crate::search::tokenize(&candidate.text))
+            .collect();
+        let index = crate::search::Bm25Index::from_documents(&documents);
+        let results: Vec<MaterialSearchResult> = index
+            .rank(&query_tokens)
+            .into_iter()
+            .take(limit)
+            .map(|(doc_id, score)| chunk_to_result(&candidates[doc_id], &query_tokens, score))
+            .collect();
         let next_tool = if results.is_empty() {
             status.next_tool.clone()
         } else {
@@ -807,7 +906,10 @@ struct PaperPaths {
 
 impl PaperPaths {
     fn new(cache_root: impl Into<PathBuf>, arxiv_id: &str) -> Self {
-        let cache_dir = paths::paper_cache_dir(cache_root, arxiv_id);
+        Self::from_cache_dir(paths::paper_cache_dir(cache_root, arxiv_id))
+    }
+
+    fn from_cache_dir(cache_dir: PathBuf) -> Self {
         let source_dir = cache_dir.join("source");
         Self {
             metadata_path: cache_dir.join("metadata.json"),
@@ -859,7 +961,7 @@ pub fn normalize_arxiv_id(input: &str) -> Result<String> {
     }
 }
 
-fn base_arxiv_id(arxiv_id: &str) -> String {
+pub(crate) fn base_arxiv_id(arxiv_id: &str) -> String {
     let version_re = Regex::new(r"(?i)v\d+$").expect("valid version regex");
     version_re.replace(arxiv_id, "").to_string()
 }
@@ -1072,81 +1174,96 @@ fn has_searchable_source_material(paths: &PaperPaths, manifest: Option<&SourceMa
         })
 }
 
-fn search_metadata(
-    query: &str,
+const SNIPPET_MAX_CHARS: usize = 400;
+const SNIPPET_LEAD_CHARS: usize = 120;
+
+fn chunk_to_result(
+    chunk: &MaterialChunk,
+    query_tokens: &[String],
+    score: f64,
+) -> MaterialSearchResult {
+    MaterialSearchResult {
+        source: chunk.source.clone(),
+        field: chunk.field.clone(),
+        path: chunk.path.clone(),
+        line_start: chunk.line_start,
+        line_end: chunk.line_end,
+        snippet: make_snippet(&chunk.text, query_tokens),
+        score: (score * 1e4).round() / 1e4,
+    }
+}
+
+/// Resolve the index key and chunks for one cached paper. Keyed by the
+/// version-stripped id so fetch-time indexing (request ids are usually
+/// unversioned), rescan indexing (metadata ids are versioned), and search
+/// filters all address the same documents.
+fn paper_material_for_index(
+    paths: &PaperPaths,
+    fallback_id: &str,
+) -> Result<(String, Vec<MaterialChunk>)> {
+    let canonical_id = if paths.metadata_path.exists() {
+        read_json::<PaperMetadata>(&paths.metadata_path)?.arxiv_id
+    } else {
+        fallback_id.to_string()
+    };
+    let chunks = collect_paper_material(paths)?;
+    Ok((base_arxiv_id(&canonical_id), chunks))
+}
+
+/// Collect every rankable unit of a paper's cached material: metadata
+/// fields, citation records, and TeX/source paragraphs.
+fn collect_paper_material(paths: &PaperPaths) -> Result<Vec<MaterialChunk>> {
+    let metadata: Option<PaperMetadata> = if paths.metadata_path.exists() {
+        Some(read_json(&paths.metadata_path)?)
+    } else {
+        None
+    };
+    let manifest = read_or_infer_manifest(paths)?;
+    let mut chunks = Vec::new();
+    collect_metadata_candidates(&metadata, &mut chunks);
+    collect_citation_candidates(&paths.citations_path, &mut chunks)?;
+    collect_source_candidates(paths, manifest.as_ref(), &mut chunks)?;
+    Ok(chunks)
+}
+
+fn collect_metadata_candidates(
     metadata: &Option<PaperMetadata>,
-    limit: usize,
-    results: &mut Vec<MaterialSearchResult>,
+    candidates: &mut Vec<MaterialChunk>,
 ) {
     let Some(metadata) = metadata else {
         return;
     };
-    push_metadata_match(query, "title", metadata.title.as_deref(), limit, results);
-    push_metadata_match(
-        query,
-        "abstract",
-        metadata.summary.as_deref(),
-        limit,
-        results,
-    );
-    let authors = (!metadata.authors.is_empty()).then(|| metadata.authors.join(", "));
-    push_metadata_match(query, "authors", authors.as_deref(), limit, results);
-    let categories = (!metadata.categories.is_empty()).then(|| metadata.categories.join(", "));
-    push_metadata_match(query, "categories", categories.as_deref(), limit, results);
-    push_metadata_match(
-        query,
-        "primary_category",
-        metadata.primary_category.as_deref(),
-        limit,
-        results,
-    );
-    push_metadata_match(
-        query,
-        "comment",
-        metadata.comment.as_deref(),
-        limit,
-        results,
-    );
-    push_metadata_match(
-        query,
-        "journal_ref",
-        metadata.journal_ref.as_deref(),
-        limit,
-        results,
-    );
-    push_metadata_match(query, "doi", metadata.doi.as_deref(), limit, results);
-}
-
-fn push_metadata_match(
-    query: &str,
-    field: &str,
-    value: Option<&str>,
-    limit: usize,
-    results: &mut Vec<MaterialSearchResult>,
-) {
-    if results.len() >= limit {
-        return;
-    }
-    let Some(value) = value else {
-        return;
+    let mut push = |field: &'static str, value: Option<String>| {
+        if let Some(text) = value.filter(|text| !text.trim().is_empty()) {
+            candidates.push(MaterialChunk {
+                source: "metadata".to_string(),
+                field: Some(field.to_string()),
+                path: None,
+                line_start: None,
+                line_end: None,
+                text,
+            });
+        }
     };
-    if contains_query(value, query) {
-        results.push(MaterialSearchResult {
-            source: "metadata".to_string(),
-            field: Some(field.to_string()),
-            path: None,
-            line_start: None,
-            line_end: None,
-            snippet: clean_ws(value.to_string()),
-        });
-    }
+    push("title", metadata.title.clone());
+    push("abstract", metadata.summary.clone());
+    push(
+        "authors",
+        (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
+    );
+    push(
+        "categories",
+        (!metadata.categories.is_empty()).then(|| metadata.categories.join(", ")),
+    );
+    push("primary_category", metadata.primary_category.clone());
+    push("comment", metadata.comment.clone());
+    push("journal_ref", metadata.journal_ref.clone());
+    push("doi", metadata.doi.clone());
 }
 
-fn search_citations(
-    query: &str,
+fn collect_citation_candidates(
     citations_path: &Path,
-    limit: usize,
-    results: &mut Vec<MaterialSearchResult>,
+    candidates: &mut Vec<MaterialChunk>,
 ) -> Result<()> {
     if !citations_path.exists() {
         return Ok(());
@@ -1154,61 +1271,48 @@ fn search_citations(
     let text = fs::read_to_string(citations_path)
         .with_context(|| format!("reading {}", citations_path.display()))?;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        if results.len() >= limit {
-            break;
-        }
         let record: CitationRecord = serde_json::from_str(line)
             .with_context(|| format!("parsing citation JSONL {}", citations_path.display()))?;
-        let haystack = format!(
-            "{} {} {}",
-            record.cited_arxiv_id, record.source_file, record.context
-        );
-        if contains_query(&haystack, query) {
-            results.push(MaterialSearchResult {
-                source: "citation".to_string(),
-                field: Some("context".to_string()),
-                path: Some(record.source_file),
-                line_start: Some(record.line),
-                line_end: Some(record.line),
-                snippet: record.context,
-            });
-        }
+        candidates.push(MaterialChunk {
+            source: "citation".to_string(),
+            field: Some("context".to_string()),
+            path: Some(record.source_file.clone()),
+            line_start: Some(record.line),
+            line_end: Some(record.line),
+            text: format!(
+                "{} {} {}",
+                record.cited_arxiv_id, record.source_file, record.context
+            ),
+        });
     }
     Ok(())
 }
 
-fn search_source_material(
-    query: &str,
+fn collect_source_candidates(
     paths: &PaperPaths,
     manifest: Option<&SourceManifest>,
-    limit: usize,
-    results: &mut Vec<MaterialSearchResult>,
+    candidates: &mut Vec<MaterialChunk>,
 ) -> Result<()> {
     for root in source_search_roots(paths, manifest) {
         if !root.exists() {
             continue;
         }
         for entry in WalkDir::new(&root).follow_links(false) {
-            if results.len() >= limit {
-                return Ok(());
-            }
             let entry =
                 entry.with_context(|| format!("walking source directory {}", root.display()))?;
             if !entry.file_type().is_file() || !is_searchable_source_file(entry.path()) {
                 continue;
             }
-            search_source_file(query, entry.path(), limit, results)?;
+            collect_source_file_candidates(entry.path(), candidates)?;
         }
     }
     Ok(())
 }
 
-fn search_source_file(
-    query: &str,
-    path: &Path,
-    limit: usize,
-    results: &mut Vec<MaterialSearchResult>,
-) -> Result<()> {
+/// Split a source file into paragraphs (runs of non-blank lines). Paragraphs
+/// are the ranking unit: TeX wraps sentences across lines, so line-level
+/// matching misses multi-term queries that paragraph-level scoring catches.
+fn collect_source_file_candidates(path: &Path, candidates: &mut Vec<MaterialChunk>) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() > 5 * 1024 * 1024 {
         return Ok(());
@@ -1216,23 +1320,68 @@ fn search_source_file(
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(());
     };
-    for (line_index, line) in text.lines().enumerate() {
-        if results.len() >= limit {
-            break;
-        }
-        if contains_query(line, query) {
-            let line_number = line_index + 1;
-            results.push(MaterialSearchResult {
+    let mut paragraph: Vec<&str> = Vec::new();
+    let mut paragraph_start = 0usize;
+    let mut flush = |paragraph: &mut Vec<&str>, start: usize, end: usize| {
+        if !paragraph.is_empty() {
+            candidates.push(MaterialChunk {
                 source: "source".to_string(),
                 field: None,
                 path: Some(display_path(path)),
-                line_start: Some(line_number),
-                line_end: Some(line_number),
-                snippet: clean_ws(line.to_string()),
+                line_start: Some(start),
+                line_end: Some(end),
+                text: paragraph.join("\n"),
             });
+            paragraph.clear();
+        }
+    };
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() {
+            flush(
+                &mut paragraph,
+                paragraph_start,
+                line_number.saturating_sub(1),
+            );
+        } else {
+            if paragraph.is_empty() {
+                paragraph_start = line_number;
+            }
+            paragraph.push(line);
         }
     }
+    let line_count = text.lines().count();
+    flush(&mut paragraph, paragraph_start, line_count);
     Ok(())
+}
+
+/// Whitespace-normalize and, when the text is long, center the excerpt on
+/// the first query-term occurrence so the match is visible in the snippet.
+fn make_snippet(text: &str, query_tokens: &[String]) -> String {
+    let cleaned = clean_ws(text.to_string());
+    if cleaned.chars().count() <= SNIPPET_MAX_CHARS {
+        return cleaned;
+    }
+    let lowercase = cleaned.to_lowercase();
+    let match_byte = query_tokens
+        .iter()
+        .filter_map(|token| lowercase.find(token.as_str()))
+        .min()
+        .unwrap_or(0);
+    let match_char = cleaned[..match_byte.min(cleaned.len())].chars().count();
+    let start_char = match_char.saturating_sub(SNIPPET_LEAD_CHARS);
+    let excerpt: String = cleaned
+        .chars()
+        .skip(start_char)
+        .take(SNIPPET_MAX_CHARS)
+        .collect();
+    let prefix = if start_char > 0 { "…" } else { "" };
+    let suffix = if start_char + SNIPPET_MAX_CHARS < cleaned.chars().count() {
+        "…"
+    } else {
+        ""
+    };
+    format!("{prefix}{excerpt}{suffix}")
 }
 
 fn source_search_roots(paths: &PaperPaths, manifest: Option<&SourceManifest>) -> Vec<PathBuf> {
@@ -1250,10 +1399,6 @@ fn is_searchable_source_file(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("tex" | "bib" | "bbl" | "sty" | "cls" | "txt" | "md")
     )
-}
-
-fn contains_query(value: &str, query: &str) -> bool {
-    value.to_lowercase().contains(&query.to_lowercase())
 }
 
 fn materialize_source(paths: &PaperPaths, bytes: &[u8]) -> Result<SourceManifest> {
@@ -2124,6 +2269,176 @@ mod tests {
                 && result.line_start == Some(2)
                 && result.snippet.contains("Calibration citation")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn search_material_ranks_multi_term_tex_matches_best_first() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        let tex = "\\section{Analysis}\n\
+            The convergence rate of stochastic\n\
+            gradient descent depends on the step size.\n\
+            \n\
+            Gradient clipping stabilizes training.\n\
+            \n\
+            We tabulate convergence results in Table 2.\n";
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_tar_file(&mut builder, "main.tex", tex)?;
+            builder.finish()?;
+        }
+        materialize_source(&paths, &bytes)?;
+
+        let response = fetcher.search_material(SearchMaterialRequest {
+            arxiv_id: arxiv_id.to_string(),
+            query: "stochastic gradient convergence".to_string(),
+            limit: Some(10),
+        })?;
+
+        assert_eq!(response.results.len(), 3);
+        // The paragraph containing all three query terms — spread across
+        // lines 1-3, which line-based substring search could never match —
+        // must rank first.
+        let top = &response.results[0];
+        assert_eq!(top.line_start, Some(1));
+        assert_eq!(top.line_end, Some(3));
+        assert!(top.snippet.contains("stochastic"));
+        for pair in response.results.windows(2) {
+            assert!(pair[0].score >= pair[1].score);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn search_corpus_ranks_results_across_papers_and_supports_id_filter() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+
+        let build_paper = |arxiv_id: &str, title: &str, summary: &str, tex: &str| -> Result<()> {
+            let paths = PaperPaths::new(temp.path(), arxiv_id);
+            write_json_pretty(
+                &paths.metadata_path,
+                &metadata_fixture(arxiv_id, title, summary),
+            )?;
+            let mut bytes = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut bytes);
+                append_tar_file(&mut builder, "main.tex", tex)?;
+                builder.finish()?;
+            }
+            materialize_source(&paths, &bytes)?;
+            Ok(())
+        };
+
+        build_paper(
+            "2401.11111",
+            "Calibration of stochastic solvers",
+            "We study calibration for stochastic differential solvers.",
+            "The calibration procedure for stochastic solvers\nconverges under mild assumptions.\n",
+        )?;
+        build_paper(
+            "2401.22222",
+            "A survey of transformers",
+            "Attention architectures reviewed.",
+            "Transformers use attention layers.\nNothing about numerical solvers here.\n",
+        )?;
+
+        let report = fetcher.index_with_material()?;
+        assert_eq!(report.indexed_papers, 2);
+        assert!(report.indexed_material_chunks > 0);
+
+        let response = fetcher.search_corpus(SearchCorpusRequest {
+            query: "calibration stochastic solvers".to_string(),
+            arxiv_id: None,
+            limit: Some(10),
+        })?;
+        assert!(!response.results.is_empty());
+        assert_eq!(response.results[0].arxiv_id, "2401.11111");
+        for pair in response.results.windows(2) {
+            assert!(pair[0].score >= pair[1].score);
+        }
+
+        let filtered = fetcher.search_corpus(SearchCorpusRequest {
+            query: "attention".to_string(),
+            arxiv_id: Some("2401.22222v9".to_string()),
+            limit: Some(10),
+        })?;
+        assert!(!filtered.results.is_empty());
+        assert!(
+            filtered
+                .results
+                .iter()
+                .all(|result| result.arxiv_id == "2401.22222")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reindexing_a_paper_replaces_rather_than_duplicates_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+
+        let first = fetcher.index_paper_material(arxiv_id)?;
+        let second = fetcher.index_paper_material(arxiv_id)?;
+        assert_eq!(first, second);
+
+        let response = fetcher.search_corpus(SearchCorpusRequest {
+            query: "calibration".to_string(),
+            arxiv_id: None,
+            limit: Some(100),
+        })?;
+        assert_eq!(response.indexed_chunks as usize, second);
+        Ok(())
+    }
+
+    #[test]
+    fn index_with_material_prunes_chunks_of_removed_papers() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+        fetcher.index_with_material()?;
+
+        fs::remove_dir_all(&paths.cache_dir)?;
+        let report = fetcher.index_with_material()?;
+        assert_eq!(report.removed_papers, 1);
+
+        let response = fetcher.search_corpus(SearchCorpusRequest {
+            query: "calibration".to_string(),
+            arxiv_id: None,
+            limit: Some(10),
+        })?;
+        assert!(response.results.is_empty());
+        assert_eq!(response.indexed_chunks, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn search_material_rejects_queries_without_indexable_terms() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let error = fetcher
+            .search_material(SearchMaterialRequest {
+                arxiv_id: "2401.12345".to_string(),
+                query: "% $ x".to_string(),
+                limit: None,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("two or more characters"));
         Ok(())
     }
 

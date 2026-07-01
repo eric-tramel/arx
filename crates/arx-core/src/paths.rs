@@ -45,6 +45,10 @@ pub fn metadata_db_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
     cache_root.as_ref().join("metadata.sqlite3")
 }
 
+pub fn search_index_dir(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+    cache_root.as_ref().join("search-index")
+}
+
 pub fn arxd_state_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
     cache_root.as_ref().join("arxd.json")
 }
