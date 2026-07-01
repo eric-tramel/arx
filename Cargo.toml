@@ -1,0 +1,29 @@
+[package]
+name = "arx"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server for cached arXiv paper retrieval"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+flate2 = "1.0"
+fs2 = "0.4"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rmcp = { version = "0.16", features = ["server", "macros", "schemars", "transport-io"] }
+roxmltree = "0.20"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tar = "0.4"
+tokio = { version = "1.48", features = ["fs", "io-std", "macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+tempfile = "3.14"
