@@ -36,7 +36,33 @@ crates/
 
 ## Install
 
-Install both binaries from a checkout:
+Recommended install from the latest GitHub release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/arx/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/eric-tramel/arx/main/install.ps1 | iex
+```
+
+The installers download the matching release archive and install both binaries: `arx` and `arx-mcp`.
+
+Override defaults:
+
+```bash
+ARX_VERSION=v0.1.0 ARX_INSTALL_DIR=$HOME/bin sh install.sh
+```
+
+```powershell
+$env:ARX_VERSION = "v0.1.0"
+$env:ARX_INSTALL_DIR = "$HOME\\bin"
+.\\install.ps1
+```
+
+Install both binaries from a checkout instead:
 
 ```bash
 cargo install --path crates/arx-cli
@@ -188,6 +214,25 @@ Each discovered non-self arXiv citation is written once to `citations.jsonl`:
 
 ```jsonl
 {"citing_arxiv_id":"2401.12345v2","cited_arxiv_id":"2101.00001v2","source_file":".../main.tex","line":12,"context":"See arXiv:2101.00001v2."}
+```
+
+## Release CI and distribution
+
+GitHub Actions builds release binaries on every push to `main` and every `v*` version tag:
+
+- Linux x86_64: `arx-x86_64-unknown-linux-gnu.tar.gz`
+- macOS arm64: `arx-aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `arx-x86_64-pc-windows-msvc.zip`
+
+Pushes to `main` produce workflow artifacts for verification. Version tags publish the same archives and `.sha256` files to GitHub Releases.
+
+Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` bootstrap installers. This keeps install friction low across Linux/macOS/Windows without adding package-manager infrastructure before there is demand. Homebrew/Scoop/cargo-dist can be layered on later using the same release archives.
+
+Create a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Development
