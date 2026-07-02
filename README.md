@@ -75,11 +75,11 @@ The installers download the matching release archive and install `arx`, `arxd`, 
 Override defaults:
 
 ```bash
-ARX_VERSION=v0.1.0 ARX_INSTALL_DIR=$HOME/bin sh install.sh
+ARX_VERSION=v0.1.1 ARX_INSTALL_DIR=$HOME/bin sh install.sh
 ```
 
 ```powershell
-$env:ARX_VERSION = "v0.1.0"
+$env:ARX_VERSION = "v0.1.1"
 $env:ARX_INSTALL_DIR = "$HOME\\bin"
 .\\install.ps1
 ```
@@ -375,13 +375,13 @@ GitHub Actions builds release binaries on every push to `main` and every `v*` ve
 
 Pushes to `main` produce workflow artifacts for verification. Version tags publish the same archives and `.sha256` files to GitHub Releases.
 
-Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` bootstrap installers. Release archives include `arx`, `arxd`, and `arx-mcp` together so frontends can boot the daemon from the same install directory. Homebrew/Scoop/cargo-dist can be layered on later using the same release archives.
+Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` bootstrap installers. Release archives include `arx`, `arxd`, and `arx-mcp` together so frontends can boot the daemon from the same install directory. The Homebrew tap consumes the same tagged source and release flow; Scoop/cargo-dist can be layered on later using the same release archives.
 
 Create a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## Development

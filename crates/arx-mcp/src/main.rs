@@ -20,7 +20,7 @@ struct Cli {
         action = ArgAction::Version,
         help = "Print version"
     )]
-    _version: bool,
+    _version: Option<bool>,
     #[command(subcommand)]
     command: Option<Command>,
 }
