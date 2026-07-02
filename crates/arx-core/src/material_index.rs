@@ -31,7 +31,7 @@ use tantivy::{
 
 /// Bump to force existing indexes to be discarded and rebuilt (e.g. after a
 /// schema change or a tantivy upgrade that breaks the on-disk format).
-const MATERIAL_INDEX_VERSION: &str = "1";
+const MATERIAL_INDEX_VERSION: &str = "2";
 const VERSION_MARKER_FILE: &str = "arx-index-version";
 const WRITER_MEMORY_BYTES: usize = 50_000_000;
 const WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -51,11 +51,25 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Content category of a material chunk, used for query-time scope filtering.
+/// Values: `title`, `metadata`, `body`, `bibliography`.
+pub type ChunkCategory = String;
+
+/// Category constants — use these when constructing MaterialChunk values.
+pub mod category {
+    pub const TITLE: &str = "title";
+    pub const METADATA: &str = "metadata";
+    pub const BODY: &str = "body";
+    pub const BIBLIOGRAPHY: &str = "bibliography";
+}
+
 /// One indexable unit of paper material: a metadata field, a citation
 /// record, or a paragraph of TeX/source text.
 #[derive(Debug, Clone)]
 pub struct MaterialChunk {
     pub source: String,
+    /// Content category for scope-based filtering (title/metadata/body/bibliography).
+    pub category: ChunkCategory,
     pub field: Option<String>,
     pub path: Option<String>,
     pub line_start: Option<usize>,
@@ -67,6 +81,8 @@ pub struct MaterialChunk {
 pub struct CorpusSearchResult {
     pub arxiv_id: String,
     pub source: String,
+    #[serde(default)]
+    pub category: Option<String>,
     #[serde(default)]
     pub field: Option<String>,
     #[serde(default)]
@@ -85,6 +101,7 @@ struct MaterialFields {
     text: Field,
     arxiv_id: Field,
     source: Field,
+    category: Field,
     field: Field,
     path: Field,
     line_start: Field,
@@ -97,6 +114,8 @@ fn material_schema() -> (Schema, MaterialFields) {
         text: builder.add_text_field("text", TEXT | STORED),
         arxiv_id: builder.add_text_field("arxiv_id", STRING | STORED),
         source: builder.add_text_field("source", STORED),
+        // Raw filterable field for scope-based query filtering (title/metadata/body/bibliography).
+        category: builder.add_text_field("category", STRING | STORED),
         field: builder.add_text_field("field", STORED),
         path: builder.add_text_field("path", STORED),
         line_start: builder.add_u64_field("line_start", STORED),
@@ -192,11 +211,13 @@ impl MaterialIndex {
 
     /// BM25-ranked search, best first. `query_tokens` are OR-combined so
     /// multi-term queries rank by relevance without requiring every term;
-    /// `arxiv_id` optionally restricts results to one paper.
+    /// `arxiv_id` optionally restricts results to one paper; `categories`
+    /// optionally restricts results to chunks with matching category values.
     pub fn search(
         &self,
         query_tokens: &[String],
         arxiv_id: Option<&str>,
+        categories: Option<&[&str]>,
         limit: usize,
     ) -> Result<Vec<CorpusSearchResult>> {
         if query_tokens.is_empty() {
@@ -218,18 +239,42 @@ impl MaterialIndex {
             })
             .collect();
         let token_query = BooleanQuery::new(token_clauses);
-        let query: Box<dyn Query> = match arxiv_id {
-            Some(arxiv_id) => Box::new(BooleanQuery::new(vec![
-                (Occur::Must, Box::new(token_query) as Box<dyn Query>),
-                (
-                    Occur::Must,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.arxiv_id, arxiv_id),
-                        IndexRecordOption::Basic,
-                    )),
-                ),
-            ])),
-            None => Box::new(token_query),
+
+        // Build filter clauses (Must): arxiv_id and/or category scope.
+        let mut must_clauses: Vec<(Occur, Box<dyn Query>)> =
+            vec![(Occur::Must, Box::new(token_query) as Box<dyn Query>)];
+        if let Some(arxiv_id) = arxiv_id {
+            must_clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.arxiv_id, arxiv_id),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let Some(cats) = categories {
+            let category_clauses: Vec<(Occur, Box<dyn Query>)> = cats
+                .iter()
+                .map(|cat| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.fields.category, cat),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            must_clauses.push((Occur::Must, Box::new(BooleanQuery::new(category_clauses))));
+        }
+        let query: Box<dyn Query> = if must_clauses.len() == 1 {
+            // No filters: unwrap the single Must token query directly.
+            // BooleanQuery with a single Must clause still works, but using
+            // the inner query directly preserves scoring behavior.
+            let (_, q) = must_clauses.remove(0);
+            q
+        } else {
+            Box::new(BooleanQuery::new(must_clauses))
         };
 
         let top_docs = searcher
@@ -275,6 +320,7 @@ impl MaterialIndex {
         document.add_text(self.fields.text, &chunk.text);
         document.add_text(self.fields.arxiv_id, arxiv_id);
         document.add_text(self.fields.source, &chunk.source);
+        document.add_text(self.fields.category, &chunk.category);
         if let Some(field) = &chunk.field {
             document.add_text(self.fields.field, field);
         }
@@ -324,6 +370,7 @@ impl MaterialIndex {
         CorpusSearchResult {
             arxiv_id: text_field(self.fields.arxiv_id).unwrap_or_default(),
             source: text_field(self.fields.source).unwrap_or_default(),
+            category: text_field(self.fields.category),
             field: text_field(self.fields.field),
             path: text_field(self.fields.path),
             line_start,
@@ -403,6 +450,7 @@ mod tests {
     fn chunk(text: &str) -> MaterialChunk {
         MaterialChunk {
             source: "source".to_string(),
+            category: category::BODY.to_string(),
             field: None,
             path: Some("main.tex".to_string()),
             line_start: Some(1),
@@ -435,7 +483,7 @@ mod tests {
         index.replace_paper("2401.11111", &[chunk("stochastic gradient descent")])?;
         assert_eq!(index.chunk_count()?, 1);
 
-        let results = index.search(&["stochastic".to_string()], None, 10)?;
+        let results = index.search(&["stochastic".to_string()], None, None, 10)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].arxiv_id, "2401.11111");
         assert_eq!(results[0].line_start, Some(1));
@@ -450,9 +498,9 @@ mod tests {
         index.replace_paper("2401.11111", &[chunk("attention transformers")])?;
         index.replace_paper("2401.22222", &[chunk("attention mechanisms everywhere")])?;
 
-        let all = index.search(&["attention".to_string()], None, 10)?;
+        let all = index.search(&["attention".to_string()], None, None, 10)?;
         assert_eq!(all.len(), 2);
-        let filtered = index.search(&["attention".to_string()], Some("2401.22222"), 10)?;
+        let filtered = index.search(&["attention".to_string()], Some("2401.22222"), None, 10)?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].arxiv_id, "2401.22222");
         Ok(())
@@ -478,6 +526,7 @@ mod tests {
             "2401.11111",
             &[MaterialChunk {
                 source: "source".to_string(),
+                category: category::BODY.to_string(),
                 field: None,
                 path: Some("main.tex".to_string()),
                 line_start: Some(1),
@@ -486,7 +535,7 @@ mod tests {
             }],
         )?;
 
-        let results = index.search(&["zebra".to_string()], None, 10)?;
+        let results = index.search(&["zebra".to_string()], None, None, 10)?;
         assert_eq!(results.len(), 1);
         let result = &results[0];
         assert!(result.snippet.contains("zebra"));
@@ -506,7 +555,7 @@ mod tests {
         assert_eq!(index.chunk_count()?, 1);
         assert!(
             index
-                .search(&["calibration".to_string()], None, 10)?
+                .search(&["calibration".to_string()], None, None, 10)?
                 .is_empty()
         );
         Ok(())
@@ -525,6 +574,116 @@ mod tests {
         )?;
         let reopened = MaterialIndex::open_or_create(temp.path())?;
         assert_eq!(reopened.chunk_count()?, 0);
+        Ok(())
+    }
+
+    fn chunk_with_category(text: &str, cat: &str) -> MaterialChunk {
+        MaterialChunk {
+            source: "source".to_string(),
+            category: cat.to_string(),
+            field: None,
+            path: Some("main.tex".to_string()),
+            line_start: Some(1),
+            line_end: Some(1),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn scope_default_excludes_bibliography_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper(
+            "2401.11111",
+            &[
+                chunk_with_category("attention transformer body content", category::BODY),
+                chunk_with_category("attention transformer bib entry", category::BIBLIOGRAPHY),
+                chunk_with_category("attention transformer title", category::TITLE),
+                chunk_with_category("attention transformer metadata", category::METADATA),
+            ],
+        )?;
+
+        // Default scope: title + metadata + body — no bibliography.
+        let default_cats: &[&str] = &[category::TITLE, category::METADATA, category::BODY];
+        let results = index.search(&["attention".to_string()], None, Some(default_cats), 10)?;
+        assert_eq!(
+            results.len(),
+            3,
+            "default scope should exclude bibliography"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.category.as_deref() != Some(category::BIBLIOGRAPHY)),
+            "bibliography chunk must not appear in default scope"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scope_bibliography_returns_only_bibliography_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper(
+            "2401.11111",
+            &[
+                chunk_with_category("deep learning body paragraph", category::BODY),
+                chunk_with_category("deep learning bib reference entry", category::BIBLIOGRAPHY),
+            ],
+        )?;
+
+        let bib_cats: &[&str] = &[category::BIBLIOGRAPHY];
+        let results = index.search(&["deep".to_string()], None, Some(bib_cats), 10)?;
+        assert_eq!(
+            results.len(),
+            1,
+            "bibliography scope should return only bibliography chunks"
+        );
+        assert_eq!(results[0].category.as_deref(), Some(category::BIBLIOGRAPHY));
+        Ok(())
+    }
+
+    #[test]
+    fn scope_all_returns_bibliography_and_body() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper(
+            "2401.11111",
+            &[
+                chunk_with_category("gradient descent body", category::BODY),
+                chunk_with_category("gradient descent bib entry", category::BIBLIOGRAPHY),
+            ],
+        )?;
+
+        // "all" scope passes no category filter (None).
+        let results = index.search(&["gradient".to_string()], None, None, 10)?;
+        assert_eq!(results.len(), 2, "all scope should return every category");
+        Ok(())
+    }
+
+    #[test]
+    fn scope_titles_returns_only_title_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        index.replace_paper(
+            "2401.11111",
+            &[
+                chunk_with_category(
+                    "Stochastic gradient descent convergence title",
+                    category::TITLE,
+                ),
+                chunk_with_category("stochastic gradient descent body paragraph", category::BODY),
+            ],
+        )?;
+
+        let title_cats: &[&str] = &[category::TITLE];
+        let results = index.search(&["stochastic".to_string()], None, Some(title_cats), 10)?;
+        assert_eq!(
+            results.len(),
+            1,
+            "titles scope should return only title chunks"
+        );
+        assert_eq!(results[0].category.as_deref(), Some(category::TITLE));
         Ok(())
     }
 }
