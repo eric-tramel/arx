@@ -15,9 +15,14 @@ use std::{
     io::{BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::LazyLock,
+    time::Duration,
 };
 use walkdir::WalkDir;
 const DOWNLOAD_MAX_ATTEMPTS: usize = 3;
+const METADATA_URL: &str = "https://export.arxiv.org/api/query";
+/// Fail-fast bound on metadata requests. Applied per-request (not on the shared
+/// client) because PDF and source downloads legitimately take longer.
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 static ARXIV_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?$")
@@ -44,6 +49,8 @@ pub struct ArxivFetcher {
     client: reqwest::Client,
     rate_limiter: RateLimiter,
     metadata_db: MetadataDatabase,
+    metadata_url: String,
+    metadata_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -315,6 +322,8 @@ impl ArxivFetcher {
             metadata_db,
             cache_root,
             client,
+            metadata_url: METADATA_URL.to_string(),
+            metadata_timeout: METADATA_REQUEST_TIMEOUT,
         })
     }
 
@@ -894,15 +903,19 @@ impl ArxivFetcher {
             .run(|| async {
                 let response = self
                     .client
-                    .get("https://export.arxiv.org/api/query")
+                    .get(&self.metadata_url)
                     .header(reqwest::header::ACCEPT_ENCODING, "identity")
                     .query(&[
                         ("id_list", id_list.as_str()),
                         ("max_results", max_results.as_str()),
                     ])
+                    // Fail fast: bound this request only, so slow arXiv error
+                    // responses cannot hang lookup. PDF/source downloads use the
+                    // shared client without this bound.
+                    .timeout(self.metadata_timeout)
                     .send()
                     .await
-                    .context("requesting arXiv metadata")?;
+                    .map_err(|error| self.map_metadata_error(error))?;
                 let status = response.status();
                 if !status.is_success() {
                     let snippet = response
@@ -919,13 +932,31 @@ impl ArxivFetcher {
                         bail!("arXiv metadata request failed: {status}: {snippet}");
                     }
                 }
-                response
-                    .text()
-                    .await
-                    .with_context(|| format!("reading arXiv metadata response for {id_list}"))
+                response.text().await.map_err(|error| {
+                    if error.is_timeout() {
+                        self.map_metadata_error(error)
+                    } else {
+                        anyhow::Error::new(error)
+                            .context(format!("reading arXiv metadata response for {id_list}"))
+                    }
+                })
             })
             .await?;
         parse_metadata_feed(arxiv_ids, &text)
+    }
+
+    /// Convert a reqwest error from a metadata request into an anyhow error,
+    /// surfacing timeouts with the configured bound so per-id error strings
+    /// explain why the request was abandoned.
+    fn map_metadata_error(&self, error: reqwest::Error) -> anyhow::Error {
+        if error.is_timeout() {
+            anyhow::anyhow!(
+                "arXiv metadata request timed out after {:?}",
+                self.metadata_timeout
+            )
+        } else {
+            anyhow::Error::new(error).context("requesting arXiv metadata")
+        }
     }
 
     async fn download_bytes(&self, url: String) -> Result<Vec<u8>> {
@@ -2953,11 +2984,8 @@ Old-style citations still appear at https://arxiv.org/pdf/hep-th/9901001.
 
         let temp = tempdir()?;
         let mut fetcher = fetcher_without_rate_limit(temp.path())?;
-        // Point at our test server.
-        fetcher.client = reqwest::Client::builder()
-            .user_agent("arx-test")
-            .build()
-            .unwrap();
+        // Point metadata requests at our test server.
+        fetcher.metadata_url = format!("http://{addr}/api/query");
 
         // Pre-cache metadata for one paper so it must survive the 500.
         let cached_id = "2401.11111";
@@ -2968,57 +2996,12 @@ Old-style citations still appear at https://arxiv.org/pdf/hep-th/9901001.
             &metadata_fixture(cached_id, "Cached paper", "Cached abstract"),
         )?;
 
-        // Override the metadata URL by monkey-patching fetch_metadata_batch indirectly
-        // through the rate_limiter's no-op and a custom client pointing at localhost.
-        // Because fetch_metadata_batch hard-codes export.arxiv.org we build the fetcher
-        // with a middleware-less client that resolves everything to our test server.
-        // The simplest approach: call lookup with fetch_missing_metadata=false and
-        // simulate the error path through fetch_metadata_batch directly.
-
-        // Test the error message format from fetch_metadata_batch directly.
-        let real_url = format!("http://{addr}/api/query");
-        let result = fetcher
-            .rate_limiter
-            .run(|| async {
-                let response = fetcher
-                    .client
-                    .get(&real_url)
-                    .send()
-                    .await
-                    .context("requesting arXiv metadata")?;
-                let status = response.status();
-                if !status.is_success() {
-                    let snippet = response
-                        .text()
-                        .await
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>();
-                    let snippet = snippet.trim().to_string();
-                    if snippet.is_empty() {
-                        bail!("arXiv metadata request failed: {status}");
-                    } else {
-                        bail!("arXiv metadata request failed: {status}: {snippet}");
-                    }
-                }
-                response.text().await.context("reading response")
-            })
-            .await;
-
-        let err = result.expect_err("500 should propagate as error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("500"), "error should mention HTTP 500: {msg}");
-        assert!(
-            msg.contains("oops"),
-            "error should include body snippet: {msg}"
-        );
-
-        // Verify cached paper is always returned.
+        // Exercise the real path: batch fails with 500, per-id fallback also
+        // fails, and the failure is attributed to the uncached id only.
         let response = fetcher
             .lookup(LookupPapersRequest {
                 arxiv_ids: vec![cached_id.to_string(), uncached_id.to_string()],
-                fetch_missing_metadata: Some(false),
+                fetch_missing_metadata: Some(true),
                 refresh_metadata: Some(false),
             })
             .await?;
@@ -3037,6 +3020,78 @@ Old-style citations still appear at https://arxiv.org/pdf/hep-th/9901001.
         assert!(
             cached_paper.error.is_none(),
             "cached paper should have no error"
+        );
+
+        let failed_paper = response
+            .papers
+            .iter()
+            .find(|p| p.arxiv_id == uncached_id)
+            .unwrap();
+        let msg = failed_paper
+            .error
+            .as_deref()
+            .expect("uncached paper should carry a per-id error");
+        assert!(msg.contains("500"), "error should mention HTTP 500: {msg}");
+        assert!(
+            msg.contains("oops"),
+            "error should include body snippet: {msg}"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_metadata_request_times_out_with_per_id_error() -> Result<()> {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+
+        // Server: accepts connections and reads requests but never responds,
+        // simulating the observed slow/hung arXiv error responses.
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                read_http_request(&mut stream).await.ok();
+                // Hold the stream open without responding.
+                streams.push(stream);
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+        fetcher.metadata_timeout = Duration::from_millis(250);
+
+        let uncached_id = "2401.99999";
+        let start = std::time::Instant::now();
+        let response = fetcher
+            .lookup(LookupPapersRequest {
+                arxiv_ids: vec![uncached_id.to_string()],
+                fetch_missing_metadata: Some(true),
+                refresh_metadata: Some(false),
+            })
+            .await?;
+        let elapsed = start.elapsed();
+
+        // Batch attempt + per-id fallback, each bounded at 250ms.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "lookup must fail fast instead of hanging (took {elapsed:?})"
+        );
+
+        assert_eq!(response.papers.len(), 1);
+        let msg = response.papers[0]
+            .error
+            .as_deref()
+            .expect("timed-out paper should carry a per-id error");
+        assert!(
+            msg.contains("timed out after"),
+            "error should describe the timeout: {msg}"
         );
 
         server.abort();
