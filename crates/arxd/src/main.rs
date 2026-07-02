@@ -334,11 +334,13 @@ impl Drop for ActiveRequestGuard {
 }
 impl DownloadQueue {
     fn new(fetcher: Arc<ArxivFetcher>, persisted_finished: Vec<DownloadJobStatus>) -> Self {
+        let next_job_id = seed_next_job_id(&persisted_finished);
         Self {
             fetcher,
             semaphore: Arc::new(Semaphore::new(DOWNLOAD_WORKERS)),
             state: Arc::new(Mutex::new(QueueState {
                 persisted_finished,
+                next_job_id,
                 ..QueueState::default()
             })),
         }
@@ -522,7 +524,7 @@ impl DownloadQueue {
         let fetcher = self.fetcher.clone();
         let semaphore = self.semaphore.clone();
         let worker_state = self.state.clone();
-        let finish_state = self.state.clone();
+        let finish_queue = self.clone();
         let finish_job_id = job_id.clone();
         let handle =
             tokio::spawn(
@@ -530,9 +532,37 @@ impl DownloadQueue {
             );
 
         tokio::spawn(async move {
-            finish_worker_task(finish_state, finish_job_id, handle).await;
+            finish_worker_task(finish_queue.state.clone(), finish_job_id, handle).await;
+            // Write-through: persist finished jobs the moment each job
+            // reaches a terminal state. Persisting only at graceful shutdown
+            // loses the whole session's history when arxd dies with its
+            // parent process group (observed live: a codex exit took down
+            // arx-mcp and arxd, erasing 10 finished jobs).
+            finish_queue.persist_finished().await;
         });
     }
+
+    async fn persist_finished(&self) {
+        let finished = self.finished_jobs_for_persistence().await;
+        if let Err(error) = write_finished_jobs(self.fetcher.cache_root(), &finished) {
+            tracing::warn!(?error, "failed to persist finished jobs");
+        }
+    }
+}
+
+/// Continue job numbering after persisted history: a fresh arxd that
+/// restarts at download-1 shadows same-named finished records, so completed
+/// history silently disappears from queue status.
+fn seed_next_job_id(persisted_finished: &[DownloadJobStatus]) -> u64 {
+    persisted_finished
+        .iter()
+        .filter_map(|job| {
+            job.job_id
+                .strip_prefix("download-")
+                .and_then(|number| number.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 type WorkerResult = Option<std::result::Result<FetchPaperResponse, String>>;
@@ -903,6 +933,69 @@ mod tests {
                 None
             },
         }
+    }
+
+    #[test]
+    fn next_job_id_continues_after_persisted_history() {
+        let persisted = vec![
+            make_finished_job_status(
+                "download-3",
+                "2401.00001",
+                DownloadJobState::Completed,
+                1_000,
+            ),
+            make_finished_job_status("download-16", "2401.00002", DownloadJobState::Failed, 2_000),
+        ];
+        assert_eq!(seed_next_job_id(&persisted), 16);
+        assert_eq!(seed_next_job_id(&[]), 0);
+    }
+
+    #[tokio::test]
+    async fn persist_finished_writes_through_without_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().to_path_buf();
+        let fetcher = Arc::new(arx_core::arxiv::ArxivFetcher::new(cache_root.clone()).unwrap());
+        let persisted = vec![make_finished_job_status(
+            "download-1",
+            "2401.00001",
+            DownloadJobState::Completed,
+            1_000,
+        )];
+        let queue = DownloadQueue::new(fetcher, persisted);
+
+        // Simulate a job finishing while arxd is alive; write-through must
+        // land it on disk without waiting for a graceful shutdown.
+        {
+            let mut state = queue.state.lock().await;
+            state.jobs.push(DownloadJob {
+                job_id: "download-2".to_string(),
+                arxiv_id: "2401.00002".to_string(),
+                request: FetchPaperRequest {
+                    arxiv_id: "2401.00002".to_string(),
+                    include_pdf: Some(false),
+                    include_source: Some(false),
+                    refresh: Some(false),
+                },
+                status: DownloadJobState::Failed,
+                queued_at_unix_ms: 5_000,
+                started_at_unix_ms: Some(6_000),
+                finished_at_unix_ms: Some(7_000),
+                result: None,
+                error: Some("simulated failure".to_string()),
+            });
+        }
+        queue.persist_finished().await;
+
+        let reloaded = arx_core::daemon::read_finished_jobs(&cache_root);
+        let ids: Vec<&str> = reloaded.iter().map(|job| job.job_id.as_str()).collect();
+        assert!(
+            ids.contains(&"download-1"),
+            "persisted history kept: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"download-2"),
+            "live finished job written through: {ids:?}"
+        );
     }
 
     #[tokio::test]
