@@ -164,13 +164,14 @@ arx search attention --scope titles          # title-only (find papers by name)
 arx search vaswani --scope bibliography      # search citation records and .bib files
 ```
 
-By default the search scope is , which covers titles, metadata (abstract,
-authors, categories), and TeX/source body paragraphs. Bibliography content (.bib,
-.bbl files and citation records) is **excluded** from the default scope to prevent
-hits in one paper's reference list from polluting searches for papers *about* a
-topic. Use  to search bibliography content explicitly, or
- for everything. When results are empty, the  field explains why
-and what to do next (e.g. fetch the TeX source to index the body).
+By default the search scope is `default`, which covers titles, metadata
+(abstract, authors, categories), and TeX/source body paragraphs. Bibliography
+content (.bib, .bbl files and citation records) is **excluded** from the
+default scope to prevent hits in one paper's reference list from polluting
+searches for papers *about* a topic. Use `--scope bibliography` to search
+bibliography content explicitly, or `--scope all` for everything. When results
+are empty, the `note` field explains why and what to do next (e.g. fetch the
+TeX source to index the body).
 
 Locate cached files without network access:
 
