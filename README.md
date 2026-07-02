@@ -284,11 +284,12 @@ The metadata index database is stored at:
 
 Run `arx index` to ask arxd to scan existing `metadata.json` files into the database. `arx fetch` queues the fetch in arxd and, unless `--detach` is passed, waits while showing interactive progress. arxd runs the same index step before fetching a paper, then writes the fetched paper's metadata into the database.
 
-arxd state files live at:
+arxd state and log files live at:
 
 ```text
 <cache-root>/arxd.json
 <cache-root>/arxd.lock
+<cache-root>/arxd.log
 ```
 
 Paper files are stored under:

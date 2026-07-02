@@ -6,17 +6,19 @@ use arx_core::{
         DownloadQueueStatusRequest, DownloadQueueStatusResponse, QueuedFetchResponse,
         remove_endpoint, unix_ms, write_endpoint,
     },
-    paths::{arxd_lock_path, xdg_cache_root},
+    paths::{arxd_lock_path, arxd_log_path, xdg_cache_root},
     rate_limit::ARXIV_DELAY,
 };
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -27,11 +29,13 @@ use tokio::{
     sync::{Mutex, Semaphore},
     time::{sleep, timeout},
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
 
 const DOWNLOAD_WORKERS: usize = 4;
 const STATUS_TOOL_NAME: &str = "get_arxiv_download_queue_status";
 const DEFAULT_IDLE_SHUTDOWN: Duration = Duration::from_secs(30);
+const DEFAULT_LOG_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_LOG_BACKUPS: usize = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "arxd")]
@@ -87,14 +91,152 @@ struct DownloadJob {
     error: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Clone)]
+struct RollingLogWriter {
+    inner: Arc<StdMutex<RollingLogState>>,
+}
+
+struct RollingLogState {
+    path: PathBuf,
+    file: Option<File>,
+    current_len: usize,
+    max_bytes: usize,
+    backups: usize,
+}
+
+impl RollingLogWriter {
+    fn new(path: PathBuf, max_bytes: usize, backups: usize) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = open_log_file(&path, false)?;
+        let current_len = file.metadata()?.len().try_into().unwrap_or(usize::MAX);
+        Ok(Self {
+            inner: Arc::new(StdMutex::new(RollingLogState {
+                path,
+                file: Some(file),
+                current_len,
+                max_bytes: max_bytes.max(1),
+                backups,
+            })),
+        })
+    }
+}
+
+impl Write for RollingLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("arxd log writer lock poisoned"))?;
+        state.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("arxd log writer lock poisoned"))?;
+        match state.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for RollingLogWriter {
+    type Writer = RollingLogWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl RollingLogState {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.current_len > 0 && self.current_len.saturating_add(buf.len()) > self.max_bytes {
+            self.rotate()?;
+        }
+        self.file
+            .as_mut()
+            .expect("arxd rolling log file must be open")
+            .write_all(buf)?;
+        self.current_len = self.current_len.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+        }
+        for index in (1..=self.backups).rev() {
+            let source = if index == 1 {
+                self.path.clone()
+            } else {
+                numbered_log_path(&self.path, index - 1)
+            };
+            let destination = numbered_log_path(&self.path, index);
+            if index == self.backups {
+                remove_if_exists(&destination)?;
+            }
+            rename_if_exists(&source, &destination)?;
+        }
+        self.file = Some(open_log_file(&self.path, true)?);
+        self.current_len = 0;
+        Ok(())
+    }
+}
+
+fn open_log_file(path: &Path, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if truncate {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    options.open(path)
+}
+
+fn numbered_log_path(path: &Path, index: usize) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("arxd.log"));
+    file_name.push(format!(".{index}"));
+    path.with_file_name(file_name)
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rename_if_exists(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn init_logging(cache_root: &Path) -> Result<()> {
+    let log_path = arxd_log_path(cache_root);
+    let log_writer = RollingLogWriter::new(log_path, DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_BACKUPS)
+        .with_context(|| format!("opening arxd log under {}", cache_root.display()))?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .with_writer(std::io::stderr)
+        .with_writer(log_writer)
         .with_ansi(false)
-        .init();
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initializing arxd file logger: {error}"))
+}
 
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { cache_root } => {
@@ -102,6 +244,8 @@ async fn main() -> Result<()> {
                 Some(cache_root) => cache_root,
                 None => xdg_cache_root()?,
             };
+            init_logging(&cache_root)?;
+            tracing::info!(log_path = %arxd_log_path(&cache_root).display(), "arxd logging initialized");
             ArxdDaemon::new(cache_root)?.serve().await
         }
     }
@@ -569,7 +713,41 @@ fn worker_hold_duration() -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use tempfile::tempdir;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn rolling_log_writer_rotates_current_log_into_numbered_backups_before_overflowing()
+    -> std::io::Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("arxd.log");
+        let backup_1 = path.with_file_name("arxd.log.1");
+        let backup_2 = path.with_file_name("arxd.log.2");
+        let mut writer = RollingLogWriter::new(path.clone(), 10, 2)?;
+
+        writer.write_all(b"first\n")?;
+        writer.flush()?;
+
+        assert_eq!(fs::read_to_string(&path)?, "first\n");
+        assert!(!backup_1.exists());
+
+        writer.write_all(b"second\n")?;
+        writer.flush()?;
+
+        assert_eq!(fs::read_to_string(&path)?, "second\n");
+        assert_eq!(fs::read_to_string(&backup_1)?, "first\n");
+        assert!(!backup_2.exists());
+
+        writer.write_all(b"third\n")?;
+        writer.flush()?;
+
+        assert_eq!(fs::read_to_string(&path)?, "third\n");
+        assert_eq!(fs::read_to_string(&backup_1)?, "second\n");
+        assert_eq!(fs::read_to_string(&backup_2)?, "first\n");
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn finish_worker_task_marks_panicked_in_progress_job_failed() {
