@@ -118,7 +118,7 @@ fn lookup_local_only_returns_cached_metadata_status_without_starting_arxd()
     assert_eq!(cached["material_state"]["citations"], "ready");
     assert_eq!(cached["material_state"]["source_search"], "ready");
     assert_eq!(cached["citation_count"], 1);
-    assert_eq!(cached["next_tool"], "search_arxiv_material");
+    assert_eq!(cached["next_tool"], "full_text_search");
     assert_eq!(
         cached["paths"]["source_extracted_dir"],
         path_value(&cache_root.join("papers/2401.12345/source/extracted"))

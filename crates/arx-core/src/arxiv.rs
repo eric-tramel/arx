@@ -225,25 +225,8 @@ pub enum MaterialState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SearchMaterialRequest {
-    pub arxiv_id: String,
-    pub query: String,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SearchMaterialResponse {
-    pub arxiv_id: String,
-    pub query: String,
-    pub material_state: PaperMaterialStates,
-    pub results: Vec<MaterialSearchResult>,
-    pub next_tool: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SearchCorpusRequest {
-    #[schemars(description = "Free-text query, BM25-ranked across all locally indexed papers.")]
+pub struct FullTextSearchRequest {
+    #[schemars(description = "Free-text query, BM25-ranked across locally cached paper material.")]
     pub query: String,
     #[serde(default)]
     #[schemars(description = "Optional arXiv id to restrict results to a single paper.")]
@@ -253,28 +236,11 @@ pub struct SearchCorpusRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SearchCorpusResponse {
+pub struct FullTextSearchResponse {
     pub query: String,
     #[schemars(description = "Total material chunks in the persistent index.")]
     pub indexed_chunks: u64,
     pub results: Vec<CorpusSearchResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MaterialSearchResult {
-    pub source: String,
-    #[serde(default)]
-    pub field: Option<String>,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub line_start: Option<usize>,
-    #[serde(default)]
-    pub line_end: Option<usize>,
-    pub snippet: String,
-    #[serde(default)]
-    #[schemars(description = "BM25 relevance score; results are sorted best-first.")]
-    pub score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,14 +352,19 @@ impl ArxivFetcher {
         Ok(report)
     }
 
-    /// BM25-ranked search across ALL locally indexed paper material via the
-    /// persistent Tantivy index under the cache root.
-    pub fn search_corpus(&self, request: SearchCorpusRequest) -> Result<SearchCorpusResponse> {
+    /// BM25-ranked full-text search over locally cached paper material via
+    /// the persistent Tantivy index; `arxiv_id` optionally narrows the scope
+    /// to one paper. Self-heals the index when it is missing content that
+    /// the paper cache has, so callers never manage indexing explicitly.
+    pub fn full_text_search(
+        &self,
+        request: FullTextSearchRequest,
+    ) -> Result<FullTextSearchResponse> {
         let query = request.query.trim();
         if query.is_empty() {
             bail!("search query must not be empty");
         }
-        let query_tokens = crate::search::tokenize(query);
+        let query_tokens = crate::material_index::tokenize(query);
         if query_tokens.is_empty() {
             bail!("search query must contain at least one term of two or more characters");
         }
@@ -405,8 +376,25 @@ impl ArxivFetcher {
             .transpose()?
             .map(|arxiv_id| base_arxiv_id(&arxiv_id));
         let index = MaterialIndex::open_or_create(&self.cache_root)?;
+
+        match arxiv_id.as_deref() {
+            Some(arxiv_id) => {
+                let paths = PaperPaths::new(&self.cache_root, arxiv_id);
+                if index.paper_chunk_count(arxiv_id)? == 0 && paths.cache_dir.exists() {
+                    self.index_paper_material(arxiv_id)?;
+                }
+            }
+            None => {
+                if index.chunk_count()? == 0
+                    && !crate::metadata_db::metadata_files(&self.cache_root).is_empty()
+                {
+                    self.index_with_material()?;
+                }
+            }
+        }
+
         let results = index.search(&query_tokens, arxiv_id.as_deref(), limit)?;
-        Ok(SearchCorpusResponse {
+        Ok(FullTextSearchResponse {
             query: query.to_string(),
             indexed_chunks: index.chunk_count()?,
             results,
@@ -649,9 +637,9 @@ impl ArxivFetcher {
         let next_tool = if material_state.metadata == MaterialState::Missing {
             Some("lookup_arxiv_papers".to_string())
         } else if material_state.source_search == MaterialState::Ready {
-            Some("search_arxiv_material".to_string())
+            Some("full_text_search".to_string())
         } else {
-            Some("prepare_arxiv_material".to_string())
+            Some("fetch_arxiv_paper".to_string())
         };
 
         Ok(PaperMaterialStatus {
@@ -674,51 +662,6 @@ impl ArxivFetcher {
             missing,
             metadata,
             citation_count,
-            next_tool,
-        })
-    }
-
-    pub fn search_material(
-        &self,
-        request: SearchMaterialRequest,
-    ) -> Result<SearchMaterialResponse> {
-        let arxiv_id = normalize_arxiv_id(&request.arxiv_id)?;
-        let query = request.query.trim();
-        if query.is_empty() {
-            bail!("search query must not be empty");
-        }
-        let query_tokens = crate::search::tokenize(query);
-        if query_tokens.is_empty() {
-            bail!("search query must contain at least one term of two or more characters");
-        }
-        let limit = request.limit.unwrap_or(20).clamp(1, 100);
-        let status = self.status(MaterialStatusRequest {
-            arxiv_id: arxiv_id.clone(),
-        })?;
-        let paths = PaperPaths::new(&self.cache_root, &arxiv_id);
-        let candidates = collect_paper_material(&paths)?;
-
-        let documents: Vec<Vec<String>> = candidates
-            .iter()
-            .map(|candidate| crate::search::tokenize(&candidate.text))
-            .collect();
-        let index = crate::search::Bm25Index::from_documents(&documents);
-        let results: Vec<MaterialSearchResult> = index
-            .rank(&query_tokens)
-            .into_iter()
-            .take(limit)
-            .map(|(doc_id, score)| chunk_to_result(&candidates[doc_id], &query_tokens, score))
-            .collect();
-        let next_tool = if results.is_empty() {
-            status.next_tool.clone()
-        } else {
-            None
-        };
-        Ok(SearchMaterialResponse {
-            arxiv_id,
-            query: query.to_string(),
-            material_state: status.material_state,
-            results,
             next_tool,
         })
     }
@@ -1174,25 +1117,6 @@ fn has_searchable_source_material(paths: &PaperPaths, manifest: Option<&SourceMa
         })
 }
 
-const SNIPPET_MAX_CHARS: usize = 400;
-const SNIPPET_LEAD_CHARS: usize = 120;
-
-fn chunk_to_result(
-    chunk: &MaterialChunk,
-    query_tokens: &[String],
-    score: f64,
-) -> MaterialSearchResult {
-    MaterialSearchResult {
-        source: chunk.source.clone(),
-        field: chunk.field.clone(),
-        path: chunk.path.clone(),
-        line_start: chunk.line_start,
-        line_end: chunk.line_end,
-        snippet: make_snippet(&chunk.text, query_tokens),
-        score: (score * 1e4).round() / 1e4,
-    }
-}
-
 /// Resolve the index key and chunks for one cached paper. Keyed by the
 /// version-stripped id so fetch-time indexing (request ids are usually
 /// unversioned), rescan indexing (metadata ids are versioned), and search
@@ -1220,7 +1144,7 @@ fn collect_paper_material(paths: &PaperPaths) -> Result<Vec<MaterialChunk>> {
     };
     let manifest = read_or_infer_manifest(paths)?;
     let mut chunks = Vec::new();
-    collect_metadata_candidates(&metadata, &mut chunks);
+    collect_metadata_candidates(&metadata, &paths.metadata_path, &mut chunks);
     collect_citation_candidates(&paths.citations_path, &mut chunks)?;
     collect_source_candidates(paths, manifest.as_ref(), &mut chunks)?;
     Ok(chunks)
@@ -1228,17 +1152,19 @@ fn collect_paper_material(paths: &PaperPaths) -> Result<Vec<MaterialChunk>> {
 
 fn collect_metadata_candidates(
     metadata: &Option<PaperMetadata>,
+    metadata_path: &Path,
     candidates: &mut Vec<MaterialChunk>,
 ) {
     let Some(metadata) = metadata else {
         return;
     };
+    let metadata_path = display_path(metadata_path);
     let mut push = |field: &'static str, value: Option<String>| {
         if let Some(text) = value.filter(|text| !text.trim().is_empty()) {
             candidates.push(MaterialChunk {
                 source: "metadata".to_string(),
                 field: Some(field.to_string()),
-                path: None,
+                path: Some(metadata_path.clone()),
                 line_start: None,
                 line_end: None,
                 text,
@@ -1353,35 +1279,6 @@ fn collect_source_file_candidates(path: &Path, candidates: &mut Vec<MaterialChun
     let line_count = text.lines().count();
     flush(&mut paragraph, paragraph_start, line_count);
     Ok(())
-}
-
-/// Whitespace-normalize and, when the text is long, center the excerpt on
-/// the first query-term occurrence so the match is visible in the snippet.
-fn make_snippet(text: &str, query_tokens: &[String]) -> String {
-    let cleaned = clean_ws(text.to_string());
-    if cleaned.chars().count() <= SNIPPET_MAX_CHARS {
-        return cleaned;
-    }
-    let lowercase = cleaned.to_lowercase();
-    let match_byte = query_tokens
-        .iter()
-        .filter_map(|token| lowercase.find(token.as_str()))
-        .min()
-        .unwrap_or(0);
-    let match_char = cleaned[..match_byte.min(cleaned.len())].chars().count();
-    let start_char = match_char.saturating_sub(SNIPPET_LEAD_CHARS);
-    let excerpt: String = cleaned
-        .chars()
-        .skip(start_char)
-        .take(SNIPPET_MAX_CHARS)
-        .collect();
-    let prefix = if start_char > 0 { "…" } else { "" };
-    let suffix = if start_char + SNIPPET_MAX_CHARS < cleaned.chars().count() {
-        "…"
-    } else {
-        ""
-    };
-    format!("{prefix}{excerpt}{suffix}")
 }
 
 fn source_search_roots(paths: &PaperPaths, manifest: Option<&SourceManifest>) -> Vec<PathBuf> {
@@ -2151,7 +2048,7 @@ mod tests {
         assert!(ready.available_now.contains(&"metadata".to_string()));
         assert!(ready.available_now.contains(&"source_tree".to_string()));
         assert!(ready.missing.contains(&"pdf_file".to_string()));
-        assert_eq!(ready.next_tool.as_deref(), Some("search_arxiv_material"));
+        assert_eq!(ready.next_tool.as_deref(), Some("full_text_search"));
         assert_eq!(
             ready
                 .metadata
@@ -2219,8 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn search_material_returns_snippets_with_metadata_citation_and_source_provenance() -> Result<()>
-    {
+    fn scoped_search_self_heals_index_and_returns_provenance() -> Result<()> {
         let temp = tempdir()?;
         let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
         let arxiv_id = "2401.12345";
@@ -2236,19 +2132,29 @@ mod tests {
         let manifest = materialize_source(&paths, &searchable_source_bundle()?)?;
         extract_citations(arxiv_id, &paths, &manifest)?;
 
-        let response = fetcher.search_material(SearchMaterialRequest {
-            arxiv_id: arxiv_id.to_string(),
+        // The paper was never indexed explicitly: the scoped search must
+        // notice the empty per-paper index and index it on the fly.
+        let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "calibration".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
             limit: Some(10),
         })?;
 
-        assert_eq!(response.arxiv_id, arxiv_id);
         assert_eq!(response.query, "calibration");
-        assert_eq!(response.material_state.source_search, MaterialState::Ready);
-        assert!(response.next_tool.is_none());
+        assert!(response.indexed_chunks > 0);
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|result| result.arxiv_id == arxiv_id)
+        );
         assert!(response.results.iter().any(|result| {
             result.source == "metadata"
                 && result.field.as_deref() == Some("title")
+                && result
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("metadata.json"))
                 && result.snippet.contains("Calibration theorem")
         }));
         assert!(response.results.iter().any(|result| {
@@ -2273,7 +2179,30 @@ mod tests {
     }
 
     #[test]
-    fn search_material_ranks_multi_term_tex_matches_best_first() -> Result<()> {
+    fn corpus_search_self_heals_empty_index_from_cached_papers() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+
+        // No explicit indexing: the unscoped search must rebuild the empty
+        // index from the paper cache before answering.
+        let response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: None,
+            limit: Some(10),
+        })?;
+        assert!(response.indexed_chunks > 0);
+        assert!(!response.results.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_search_ranks_multi_term_tex_matches_best_first() -> Result<()> {
         let temp = tempdir()?;
         let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
         let arxiv_id = "2401.12345";
@@ -2293,9 +2222,9 @@ mod tests {
         }
         materialize_source(&paths, &bytes)?;
 
-        let response = fetcher.search_material(SearchMaterialRequest {
-            arxiv_id: arxiv_id.to_string(),
+        let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "stochastic gradient convergence".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
             limit: Some(10),
         })?;
 
@@ -2314,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn search_corpus_ranks_results_across_papers_and_supports_id_filter() -> Result<()> {
+    fn full_text_search_ranks_results_across_papers_and_supports_id_filter() -> Result<()> {
         let temp = tempdir()?;
         let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
 
@@ -2351,7 +2280,7 @@ mod tests {
         assert_eq!(report.indexed_papers, 2);
         assert!(report.indexed_material_chunks > 0);
 
-        let response = fetcher.search_corpus(SearchCorpusRequest {
+        let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "calibration stochastic solvers".to_string(),
             arxiv_id: None,
             limit: Some(10),
@@ -2362,7 +2291,7 @@ mod tests {
             assert!(pair[0].score >= pair[1].score);
         }
 
-        let filtered = fetcher.search_corpus(SearchCorpusRequest {
+        let filtered = fetcher.full_text_search(FullTextSearchRequest {
             query: "attention".to_string(),
             arxiv_id: Some("2401.22222v9".to_string()),
             limit: Some(10),
@@ -2392,7 +2321,7 @@ mod tests {
         let second = fetcher.index_paper_material(arxiv_id)?;
         assert_eq!(first, second);
 
-        let response = fetcher.search_corpus(SearchCorpusRequest {
+        let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "calibration".to_string(),
             arxiv_id: None,
             limit: Some(100),
@@ -2417,7 +2346,7 @@ mod tests {
         let report = fetcher.index_with_material()?;
         assert_eq!(report.removed_papers, 1);
 
-        let response = fetcher.search_corpus(SearchCorpusRequest {
+        let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "calibration".to_string(),
             arxiv_id: None,
             limit: Some(10),
@@ -2428,13 +2357,13 @@ mod tests {
     }
 
     #[test]
-    fn search_material_rejects_queries_without_indexable_terms() -> Result<()> {
+    fn full_text_search_rejects_queries_without_indexable_terms() -> Result<()> {
         let temp = tempdir()?;
         let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
         let error = fetcher
-            .search_material(SearchMaterialRequest {
-                arxiv_id: "2401.12345".to_string(),
+            .full_text_search(FullTextSearchRequest {
                 query: "% $ x".to_string(),
+                arxiv_id: Some("2401.12345".to_string()),
                 limit: None,
             })
             .unwrap_err();

@@ -24,6 +24,8 @@ crates/
 
 - Standalone CLI:
   - `arx fetch <ID>`
+  - `arx lookup <ID>`
+  - `arx search <QUERY>`
   - `arx index`
   - `arx locate <ID>`
   - `arx cache-dir`
@@ -31,10 +33,10 @@ crates/
 - Local backend daemon:
   - `arxd serve`: owns the per-cache-root queue and database updates; frontends start it automatically.
 - MCP stdio server with four tools:
-  - `index_cached_arxiv_metadata`: ask arxd to index cached metadata without network access.
-  - `fetch_arxiv_paper`: ask arxd to queue/cache a paper and return a job id immediately.
+  - `lookup_arxiv_papers`: metadata, abstract, local material readiness, and cache paths; fetches only missing metadata.
+  - `full_text_search`: BM25-ranked search over cached material for all papers, or one paper via `arxiv_id`; the index maintains itself.
+  - `fetch_arxiv_paper`: ask arxd to queue/cache a paper (PDF/source) and return a job id immediately.
   - `get_arxiv_download_queue_status`: inspect queued, active, completed, and failed downloads.
-  - `locate_cached_arxiv_paper`: return cached paths without network access.
 - Downloads arXiv metadata, PDF, and source/e-print bundle.
 - Extracts source archives when possible.
 - Writes arXiv-to-arXiv citations discovered in source/BibTeX files to `citations.jsonl`.
@@ -233,7 +235,7 @@ Run the MCP server directly:
 arx-mcp serve
 ```
 
-The MCP server is metadata-first. Start with `lookup_arxiv_papers` to get a stable local paper object, cached metadata/abstract, and explicit material readiness without fetching PDF/source. Use `get_arxiv_material_status` for local-only readiness, `search_arxiv_material` for BM25-ranked snippets within one paper's cached metadata/citations/extracted source, `search_arxiv_corpus` for BM25-ranked search across every locally cached paper, `prepare_arxiv_material` to queue PDF/source acquisition, and `get_arxiv_download_queue_status` to inspect daemon jobs. `fetch_arxiv_paper` remains as a compatibility alias for queuing downloads. `index_cached_arxiv_metadata` mirrors `arx index`.
+The MCP server publishes exactly four tools to keep the agent-facing surface small. Start with `lookup_arxiv_papers` to get a stable local paper object, cached metadata/abstract, cache paths, and explicit material readiness without fetching PDF/source. Use `full_text_search` for BM25-ranked snippets over cached metadata/citations/extracted TeX — across every cached paper by default, or scoped to one paper with `arxiv_id`; the search index maintains itself (updated on fetch, self-healing on first search), so agents never manage indexing. Use `fetch_arxiv_paper` to queue PDF/source acquisition and `get_arxiv_download_queue_status` to inspect daemon jobs. Cache maintenance (`arx index`, `arx locate`) lives in the CLI, not the MCP surface.
 
 Print a ready-to-copy MCP config snippet:
 

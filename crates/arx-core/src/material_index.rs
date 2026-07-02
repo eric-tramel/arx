@@ -38,6 +38,19 @@ const WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITER_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const SNIPPET_MAX_CHARS: usize = 400;
 
+/// Tokenize a query the same way tantivy's default tokenizer treats indexed
+/// text: split on non-alphanumeric characters and lowercase. This also
+/// handles TeX markup — `\section{Deep Learning}` yields `section`, `deep`,
+/// `learning`, and `arXiv:2101.00001` yields `arxiv`, `2101`, `00001`.
+/// Single-character tokens are dropped because inline math makes them
+/// ubiquitous noise.
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 2)
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
 /// One indexable unit of paper material: a metadata field, a citation
 /// record, or a paragraph of TeX/source text.
 #[derive(Debug, Clone)]
@@ -242,6 +255,21 @@ impl MaterialIndex {
         Ok(reader.searcher().num_docs())
     }
 
+    /// Number of indexed chunks for one paper; 0 means the paper has never
+    /// been indexed (or was pruned) and a self-heal reindex is warranted.
+    pub fn paper_chunk_count(&self, arxiv_id: &str) -> Result<u64> {
+        let reader = self.index.reader().context("opening search index reader")?;
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.arxiv_id, arxiv_id),
+            IndexRecordOption::Basic,
+        );
+        let count = reader
+            .searcher()
+            .search(&query, &tantivy::collector::Count)
+            .context("counting indexed chunks for paper")?;
+        Ok(count as u64)
+    }
+
     fn document(&self, arxiv_id: &str, chunk: &MaterialChunk) -> TantivyDocument {
         let mut document = TantivyDocument::new();
         document.add_text(self.fields.text, &chunk.text);
@@ -280,22 +308,26 @@ impl MaterialIndex {
                 .and_then(|value| value.as_u64())
                 .map(|line| line as usize)
         };
+        let text = text_field(self.fields.text).unwrap_or_default();
         let fragment = snippets.snippet_from_doc(document).fragment().to_string();
         let snippet = if fragment.trim().is_empty() {
-            truncate_chars(
-                &text_field(self.fields.text).unwrap_or_default(),
-                SNIPPET_MAX_CHARS,
-            )
+            truncate_chars(&text, SNIPPET_MAX_CHARS)
         } else {
             clean_ws(&fragment)
         };
+        let (line_start, line_end) = snippet_lines(
+            line_field(self.fields.line_start),
+            line_field(self.fields.line_end),
+            &text,
+            &fragment,
+        );
         CorpusSearchResult {
             arxiv_id: text_field(self.fields.arxiv_id).unwrap_or_default(),
             source: text_field(self.fields.source).unwrap_or_default(),
             field: text_field(self.fields.field),
             path: text_field(self.fields.path),
-            line_start: line_field(self.fields.line_start),
-            line_end: line_field(self.fields.line_end),
+            line_start,
+            line_end,
             snippet,
             score: round_score(score as f64),
         }
@@ -318,6 +350,31 @@ impl MaterialIndex {
             }
         }
     }
+}
+
+/// Narrow a chunk's line range to the lines the snippet fragment actually
+/// covers, so agents can jump straight to the match in the file. The
+/// fragment is a contiguous slice of the stored chunk text, so its position
+/// locates it; chunks can span many lines (e.g. a long .bbl block), making
+/// the full chunk range too coarse for "go read the file" follow-ups.
+fn snippet_lines(
+    chunk_start: Option<usize>,
+    chunk_end: Option<usize>,
+    text: &str,
+    fragment: &str,
+) -> (Option<usize>, Option<usize>) {
+    let Some(chunk_start) = chunk_start else {
+        return (chunk_start, chunk_end);
+    };
+    if fragment.is_empty() {
+        return (Some(chunk_start), chunk_end);
+    }
+    let Some(offset) = text.find(fragment) else {
+        return (Some(chunk_start), chunk_end);
+    };
+    let first = chunk_start + text[..offset].matches('\n').count();
+    let last = first + fragment.matches('\n').count();
+    (Some(first), Some(last))
 }
 
 fn clean_ws(value: &str) -> String {
@@ -355,6 +412,22 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_handles_tex_markup() {
+        assert_eq!(
+            tokenize(r"\section{Deep Learning} $x_i$ arXiv:2101.00001"),
+            vec!["section", "deep", "learning", "arxiv", "2101", "00001"]
+        );
+    }
+
+    #[test]
+    fn tokenize_lowercases_and_drops_single_characters() {
+        assert_eq!(
+            tokenize("A Calibration THEOREM"),
+            vec!["calibration", "theorem"]
+        );
+    }
+
+    #[test]
     fn replace_paper_is_idempotent_and_searchable() -> Result<()> {
         let temp = tempdir()?;
         let index = MaterialIndex::open_or_create(temp.path())?;
@@ -382,6 +455,45 @@ mod tests {
         let filtered = index.search(&["attention".to_string()], Some("2401.22222"), 10)?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].arxiv_id, "2401.22222");
+        Ok(())
+    }
+
+    #[test]
+    fn search_narrows_line_range_to_the_matched_fragment() -> Result<()> {
+        let temp = tempdir()?;
+        let index = MaterialIndex::open_or_create(temp.path())?;
+        // A 30-line chunk long enough (> 400 snippet chars) that the
+        // fragment cannot cover the whole text; "zebra" sits on line 25
+        // of the file (chunk starts at line 1).
+        let lines: Vec<String> = (1..=30)
+            .map(|line| {
+                if line == 25 {
+                    "the zebra stripes theorem appears here".to_string()
+                } else {
+                    format!("filler prose line {line} with padding words")
+                }
+            })
+            .collect();
+        index.replace_paper(
+            "2401.11111",
+            &[MaterialChunk {
+                source: "source".to_string(),
+                field: None,
+                path: Some("main.tex".to_string()),
+                line_start: Some(1),
+                line_end: Some(30),
+                text: lines.join("\n"),
+            }],
+        )?;
+
+        let results = index.search(&["zebra".to_string()], None, 10)?;
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert!(result.snippet.contains("zebra"));
+        let start = result.line_start.unwrap();
+        let end = result.line_end.unwrap();
+        assert!((start..=end).contains(&25), "range {start}-{end}");
+        assert!(end - start < 29, "range {start}-{end} was not narrowed");
         Ok(())
     }
 

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use arx_core::{
     arxiv::{
-        ArxivFetcher, FetchPaperRequest, FetchPaperResponse, LocatePaperRequest,
-        LocatePaperResponse, LookupPapersRequest, LookupPapersResponse, MaterialState,
-        PaperMaterialStatus, SearchCorpusRequest, SearchCorpusResponse,
+        ArxivFetcher, FetchPaperRequest, FetchPaperResponse, FullTextSearchRequest,
+        FullTextSearchResponse, LocatePaperRequest, LocatePaperResponse, LookupPapersRequest,
+        LookupPapersResponse, MaterialState, PaperMaterialStatus,
     },
     daemon::{
         ArxdClient, DownloadJobState, DownloadJobStatus, DownloadQueueStatusRequest,
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
             arxiv_id,
             limit,
         } => {
-            let response = fetcher.search_corpus(SearchCorpusRequest {
+            let response = fetcher.full_text_search(FullTextSearchRequest {
                 query: query.join(" "),
                 arxiv_id,
                 limit: Some(limit),
@@ -442,7 +442,7 @@ fn print_index_report(report: &IndexReport) {
     }
 }
 
-fn print_search_response(response: &SearchCorpusResponse) {
+fn print_search_response(response: &FullTextSearchResponse) {
     if response.results.is_empty() {
         println!(
             "{} no matches in {} indexed chunks (run `arx index` to refresh the index)",
