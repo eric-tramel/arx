@@ -56,6 +56,10 @@ pub fn arxd_state_path(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("arxd.json")
 }
 
+pub fn arxd_finished_jobs_path(cache_root: impl AsRef<Path>) -> PathBuf {
+    cache_root.as_ref().join("arxd-finished-jobs.json")
+}
+
 pub fn arxd_lock_path(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("arxd.lock")
 }

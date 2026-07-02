@@ -395,9 +395,8 @@ fn print_queued_fetch(response: &QueuedFetchResponse) {
         response.job_id
     );
     println!(
-        "{} roughly {}s remaining; queue position {}",
-        yellow("eta:"),
-        response.estimated_seconds_remaining,
+        "{} queue position {}",
+        yellow("position:"),
         response.queue_position
     );
 }
@@ -506,8 +505,8 @@ fn print_queue_status(status: &DownloadQueueStatusResponse) {
         if let Some(position) = job.queue_position {
             details.push_str(&format!(" position {position}"));
         }
-        if job.estimated_seconds_remaining > 0 {
-            details.push_str(&format!(" eta {}s", job.estimated_seconds_remaining));
+        if let Some(elapsed) = job.elapsed_seconds {
+            details.push_str(&format!(" elapsed {elapsed}s"));
         }
         if let Some(error) = &job.error {
             details.push_str(&format!(" error {error}"));
@@ -593,7 +592,7 @@ fn progress_log(progress: &ProgressBar, message: String) {
 }
 
 fn new_fetch_progress_bar(queued: &QueuedFetchResponse) -> ProgressBar {
-    let progress = ProgressBar::new(queued.estimated_seconds_remaining.max(1));
+    let progress = ProgressBar::new_spinner();
     progress.set_style(fetch_progress_style());
     progress.enable_steady_tick(Duration::from_millis(120));
     progress.set_message(format!(
@@ -606,30 +605,18 @@ fn new_fetch_progress_bar(queued: &QueuedFetchResponse) -> ProgressBar {
 }
 
 fn update_fetch_progress(progress: &ProgressBar, job: &DownloadJobStatus) {
-    let total = job
-        .estimated_seconds_until_start
-        .saturating_add(job.estimated_seconds_remaining)
-        .max(job.estimated_seconds_remaining)
-        .max(1);
-    if total > progress.length().unwrap_or(0) {
-        progress.set_length(total);
-    }
-    let length = progress.length().unwrap_or(total).max(1);
-    let position = length.saturating_sub(job.estimated_seconds_remaining.min(length));
-    progress.set_position(position);
     let message = match job.status {
         DownloadJobState::Queued => format!(
-            "{} {} queue position {} eta {}s",
+            "{} {} queue position {}",
             cyan("queued"),
             job.arxiv_id,
             job.queue_position.unwrap_or(0),
-            job.estimated_seconds_remaining
         ),
         DownloadJobState::InProgress => format!(
-            "{} {} eta {}s",
+            "{} {} elapsed {}s",
             yellow("fetching"),
             job.arxiv_id,
-            job.estimated_seconds_remaining
+            job.elapsed_seconds.unwrap_or(0),
         ),
         DownloadJobState::Completed => format!("{} {}", green("completed"), job.arxiv_id),
         DownloadJobState::Failed => format!("{} {}", red("failed"), job.arxiv_id),
@@ -638,11 +625,7 @@ fn update_fetch_progress(progress: &ProgressBar, job: &DownloadJobStatus) {
 }
 
 fn fetch_progress_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.cyan} [{bar:40.cyan/blue}] {pos:>3}/{len:3}s {elapsed_precise:.dim} {msg}",
-    )
-    .unwrap()
-    .progress_chars("=>-")
+    ProgressStyle::with_template("{spinner:.cyan} {elapsed_precise:.dim} {msg}").unwrap()
 }
 
 fn cyan(value: &str) -> String {

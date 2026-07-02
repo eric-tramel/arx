@@ -229,8 +229,6 @@ Detached JSON mode prints the queued daemon job:
   "status": "queued",
   "queue_position": 1,
   "queued_at_unix_ms": 1782864000000,
-  "estimated_seconds_until_start": 0,
-  "estimated_seconds_remaining": 9,
   "status_tool": "get_arxiv_download_queue_status",
   "message": "queued arXiv download; call get_arxiv_download_queue_status with this job_id to check progress"
 }

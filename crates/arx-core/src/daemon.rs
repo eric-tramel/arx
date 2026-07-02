@@ -3,6 +3,8 @@ use crate::{
     metadata_db::IndexReport,
     paths,
 };
+
+pub const MAX_PERSISTED_FINISHED_JOBS: usize = 100;
 use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,8 +76,6 @@ pub struct QueuedFetchResponse {
     pub status: DownloadJobState,
     pub queue_position: usize,
     pub queued_at_unix_ms: u64,
-    pub estimated_seconds_until_start: u64,
-    pub estimated_seconds_remaining: u64,
     pub status_tool: String,
     pub message: String,
 }
@@ -108,9 +108,6 @@ pub struct DownloadJobStatus {
     pub queued_at_unix_ms: u64,
     pub started_at_unix_ms: Option<u64>,
     pub finished_at_unix_ms: Option<u64>,
-    pub estimated_network_requests: u64,
-    pub estimated_seconds_until_start: u64,
-    pub estimated_seconds_remaining: u64,
     pub elapsed_seconds: Option<u64>,
     pub request: FetchPaperRequest,
     pub result: Option<FetchPaperResponse>,
@@ -258,6 +255,38 @@ pub fn remove_endpoint(cache_root: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("removing arxd state {}", path.display())),
     }
+}
+
+/// Persist a bounded list of finished job records so they survive arxd restart.
+/// Only keeps the most recent `MAX_PERSISTED_FINISHED_JOBS` entries.
+pub fn write_finished_jobs(cache_root: &Path, jobs: &[DownloadJobStatus]) -> Result<()> {
+    let path = paths::arxd_finished_jobs_path(cache_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating finished-jobs directory {}", parent.display()))?;
+    }
+    let truncated: Vec<&DownloadJobStatus> = {
+        let len = jobs.len();
+        let start = len.saturating_sub(MAX_PERSISTED_FINISHED_JOBS);
+        jobs[start..].iter().collect()
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_vec_pretty(&truncated)?)
+        .with_context(|| format!("writing finished jobs to {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+/// Load previously persisted finished job records; returns an empty vec on any error
+/// (missing file, corrupt JSON) so a fresh start is always valid.
+pub fn read_finished_jobs(cache_root: &Path) -> Vec<DownloadJobStatus> {
+    let path = paths::arxd_finished_jobs_path(cache_root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<DownloadJobStatus>>(&text).unwrap_or_default()
 }
 
 pub fn unix_ms() -> u64 {
