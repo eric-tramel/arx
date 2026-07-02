@@ -9,12 +9,15 @@ use arx_core::{
         ArxdClient, DownloadJobState, DownloadJobStatus, DownloadQueueStatusRequest,
         DownloadQueueStatusResponse, QueuedFetchResponse,
     },
+    material_index::{CorpusSearchResult, tokenize},
     metadata_db::IndexReport,
     paths::xdg_cache_root,
 };
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::{
+    cmp::Ordering,
+    collections::HashMap,
     io::{self, IsTerminal},
     time::Duration,
 };
@@ -192,7 +195,22 @@ async fn main() -> Result<()> {
             if json {
                 print_json(&response)?;
             } else {
-                print_search_response(&response);
+                let arxiv_ids = unique_search_arxiv_ids(&response);
+                let metadata_by_id = if arxiv_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    search_metadata_by_id(
+                        fetcher
+                            .lookup(LookupPapersRequest {
+                                arxiv_ids,
+                                fetch_missing_metadata: Some(false),
+                                refresh_metadata: Some(false),
+                            })
+                            .await?
+                            .papers,
+                    )
+                };
+                print_search_response(&response, &metadata_by_id);
             }
         }
         Command::Locate { arxiv_id } => {
@@ -448,7 +466,24 @@ fn print_index_report(report: &IndexReport) {
     }
 }
 
-fn print_search_response(response: &FullTextSearchResponse) {
+#[derive(Debug, Clone)]
+struct SearchPaperMetadata {
+    title: Option<String>,
+    authors: Vec<String>,
+    year: Option<String>,
+}
+
+struct SearchPaperGroup<'a> {
+    arxiv_id: &'a str,
+    best_score: f64,
+    first_index: usize,
+    snippets: Vec<&'a CorpusSearchResult>,
+}
+
+fn print_search_response(
+    response: &FullTextSearchResponse,
+    metadata_by_id: &HashMap<String, SearchPaperMetadata>,
+) {
     if response.results.is_empty() {
         println!(
             "{} no matches in {} indexed chunks (scope: {})",
@@ -461,24 +496,396 @@ fn print_search_response(response: &FullTextSearchResponse) {
         }
         return;
     }
-    for result in &response.results {
-        let location = match (&result.path, result.line_start, result.line_end) {
-            (Some(path), Some(start), Some(end)) if start != end => {
-                format!("{path}:{start}-{end}")
-            }
-            (Some(path), Some(start), _) => format!("{path}:{start}"),
-            (Some(path), None, _) => path.clone(),
-            (None, _, _) => result.field.clone().unwrap_or_else(|| "-".to_string()),
-        };
-        println!(
-            "{:>8.2}  {}  {}  {}",
-            result.score,
-            cyan(&result.arxiv_id),
-            green(&result.source),
-            location
+
+    let groups = grouped_search_results(&response.results);
+    let query_terms = tokenize(&response.query);
+    let panel_width = search_panel_width();
+    println!(
+        "{} top-rated papers for {} · {} section hits · scope {} · indexed chunks {}",
+        green("results"),
+        italic(&format!("\"{}\"", response.query)),
+        response.results.len(),
+        cyan(&response.scope),
+        response.indexed_chunks
+    );
+    println!(
+        "{} showing at most 3 corroborating snippets per paper",
+        dim("note:")
+    );
+
+    for (index, group) in groups.iter().enumerate() {
+        if index > 0 {
+            println!();
+        } else {
+            println!();
+        }
+        print_search_panel(
+            group,
+            metadata_by_id.get(group.arxiv_id),
+            &query_terms,
+            panel_width,
         );
-        println!("          {}", result.snippet);
     }
+}
+
+fn unique_search_arxiv_ids(response: &FullTextSearchResponse) -> Vec<String> {
+    let mut arxiv_ids = Vec::new();
+    for result in &response.results {
+        if !arxiv_ids
+            .iter()
+            .any(|arxiv_id| arxiv_id == &result.arxiv_id)
+        {
+            arxiv_ids.push(result.arxiv_id.clone());
+        }
+    }
+    arxiv_ids
+}
+
+fn search_metadata_by_id(papers: Vec<PaperMaterialStatus>) -> HashMap<String, SearchPaperMetadata> {
+    papers
+        .into_iter()
+        .map(|paper| {
+            let metadata = paper.metadata;
+            let title = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone());
+            let authors = metadata
+                .as_ref()
+                .map(|metadata| metadata.authors.clone())
+                .unwrap_or_default();
+            let year = metadata
+                .as_ref()
+                .and_then(|metadata| publication_year(metadata.published.as_deref()))
+                .or_else(|| paper.publication_year.map(|year| year.to_string()));
+            (
+                paper.arxiv_id,
+                SearchPaperMetadata {
+                    title,
+                    authors,
+                    year,
+                },
+            )
+        })
+        .collect()
+}
+
+fn publication_year(published: Option<&str>) -> Option<String> {
+    let year = published?.get(0..4)?;
+    year.chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then(|| year.to_string())
+}
+
+fn grouped_search_results(results: &[CorpusSearchResult]) -> Vec<SearchPaperGroup<'_>> {
+    let mut groups: Vec<SearchPaperGroup<'_>> = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.arxiv_id == result.arxiv_id)
+        {
+            group.best_score = group.best_score.max(result.score);
+            group.snippets.push(result);
+        } else {
+            groups.push(SearchPaperGroup {
+                arxiv_id: &result.arxiv_id,
+                best_score: result.score,
+                first_index: index,
+                snippets: vec![result],
+            });
+        }
+    }
+    groups.sort_by(|left, right| {
+        right
+            .best_score
+            .partial_cmp(&left.best_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.first_index.cmp(&right.first_index))
+    });
+    groups
+}
+
+fn print_search_panel(
+    group: &SearchPaperGroup<'_>,
+    metadata: Option<&SearchPaperMetadata>,
+    query_terms: &[String],
+    panel_width: usize,
+) {
+    let content_width = panel_width.saturating_sub(4);
+    println!("╭{}╮", "─".repeat(content_width + 2));
+    for line in wrap_text(&paper_title(group.arxiv_id, metadata), content_width) {
+        print_panel_line(&italic(&line), content_width);
+    }
+    let snippets = corroborating_snippets(&group.snippets);
+    for line in wrap_text(
+        &paper_subtitle(group, metadata, snippets.len()),
+        content_width,
+    ) {
+        print_panel_line(&dim(&line), content_width);
+    }
+    println!("├{}┤", "─".repeat(content_width + 2));
+
+    for (index, result) in snippets.iter().enumerate() {
+        let section = result_section_label(result);
+        let location = result_location(result);
+        let label = if location == section {
+            format!("{}. {} · score {:.2}", index + 1, section, result.score)
+        } else {
+            format!(
+                "{}. {} · {} · score {:.2}",
+                index + 1,
+                section,
+                location,
+                result.score
+            )
+        };
+        for line in wrap_text(&label, content_width) {
+            print_panel_line(&green(&line), content_width);
+        }
+        let snippet = collapse_whitespace(&strip_tantivy_markup(&result.snippet));
+        let snippet_width = content_width.saturating_sub(4).max(20);
+        for line in wrap_text(&snippet, snippet_width) {
+            print_panel_line(
+                &format!("    {}", highlight_latex_line(&line, query_terms)),
+                content_width,
+            );
+        }
+        if index + 1 < snippets.len() {
+            print_panel_line("", content_width);
+        }
+    }
+    println!("╰{}╯", "─".repeat(content_width + 2));
+}
+
+fn paper_title(arxiv_id: &str, metadata: Option<&SearchPaperMetadata>) -> String {
+    metadata
+        .and_then(|metadata| metadata.title.as_deref())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(arxiv_id)
+        .to_string()
+}
+
+fn paper_subtitle(
+    group: &SearchPaperGroup<'_>,
+    metadata: Option<&SearchPaperMetadata>,
+    snippet_count: usize,
+) -> String {
+    let year = metadata
+        .and_then(|metadata| metadata.year.as_deref())
+        .unwrap_or("year unknown");
+    let author = metadata
+        .map(|metadata| author_label(&metadata.authors))
+        .filter(|author| !author.trim().is_empty())
+        .unwrap_or_else(|| "unknown author".to_string());
+    format!(
+        "{} · {} · {} · best score {:.2} · {} snippet{} shown",
+        year,
+        author,
+        group.arxiv_id,
+        group.best_score,
+        snippet_count,
+        if snippet_count == 1 { "" } else { "s" }
+    )
+}
+
+fn author_label(authors: &[String]) -> String {
+    match authors {
+        [] => "unknown author".to_string(),
+        [author] => author.clone(),
+        [first, ..] => format!("{first} et al."),
+    }
+}
+
+fn corroborating_snippets<'a>(snippets: &[&'a CorpusSearchResult]) -> Vec<&'a CorpusSearchResult> {
+    let selected = snippets
+        .iter()
+        .copied()
+        .filter(|result| result.category.as_deref() != Some("title"))
+        .take(3)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        snippets.iter().copied().take(3).collect()
+    } else {
+        selected
+    }
+}
+
+fn result_section_label(result: &CorpusSearchResult) -> &str {
+    if result.source == "metadata" {
+        result.field.as_deref().unwrap_or("metadata")
+    } else {
+        result.category.as_deref().unwrap_or("section")
+    }
+}
+
+fn result_location(result: &CorpusSearchResult) -> String {
+    if result.source == "metadata" {
+        return result
+            .field
+            .clone()
+            .unwrap_or_else(|| "metadata".to_string());
+    }
+    match (&result.path, result.line_start, result.line_end) {
+        (Some(path), Some(start), Some(end)) if start != end => {
+            format!("{}:{start}-{end}", compact_path(path, &result.arxiv_id))
+        }
+        (Some(path), Some(start), _) => format!("{}:{start}", compact_path(path, &result.arxiv_id)),
+        (Some(path), None, _) => compact_path(path, &result.arxiv_id),
+        (None, _, _) => result.field.clone().unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn compact_path(path: &str, arxiv_id: &str) -> String {
+    let safe_id = arxiv_id.replace('/', "_");
+    let marker = format!("/papers/{safe_id}/");
+    if let Some(index) = path.find(&marker) {
+        return path[index + marker.len()..].to_string();
+    }
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn search_panel_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(60, 120)
+}
+
+fn print_panel_line(value: &str, content_width: usize) {
+    println!("│ {} │", pad_ansi(value, content_width));
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let word_width = word.chars().count();
+        if current.is_empty() {
+            if word_width <= width {
+                current.push_str(word);
+            } else {
+                push_split_word(&mut lines, word, width);
+            }
+        } else if current.chars().count() + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = String::new();
+            if word_width <= width {
+                current.push_str(word);
+            } else {
+                push_split_word(&mut lines, word, width);
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn push_split_word(lines: &mut Vec<String>, word: &str, width: usize) {
+    let mut current = String::new();
+    for ch in word.chars() {
+        if current.chars().count() == width {
+            lines.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+}
+
+fn strip_tantivy_markup(value: &str) -> String {
+    value
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace("<em>", "")
+        .replace("</em>", "")
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn highlight_latex_line(line: &str, query_terms: &[String]) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut highlighted = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            let start = index;
+            index += 1;
+            while index < chars.len() && chars[index].is_alphabetic() {
+                index += 1;
+            }
+            let command = chars[start..index].iter().collect::<String>();
+            let command_name = chars[start + 1..index]
+                .iter()
+                .collect::<String>()
+                .to_lowercase();
+            if !command_name.is_empty() && query_terms.contains(&command_name) {
+                highlighted.push_str(&keyword_hit(&command));
+            } else {
+                highlighted.push_str(&cyan(&command));
+            }
+        } else if ch.is_alphanumeric() {
+            let start = index;
+            index += 1;
+            while index < chars.len() && chars[index].is_alphanumeric() {
+                index += 1;
+            }
+            let token = chars[start..index].iter().collect::<String>();
+            if query_terms.contains(&token.to_lowercase()) {
+                highlighted.push_str(&keyword_hit(&token));
+            } else {
+                highlighted.push_str(&token);
+            }
+        } else if matches!(ch, '{' | '}' | '[' | ']' | '(' | ')') {
+            highlighted.push_str(&dim(&ch.to_string()));
+            index += 1;
+        } else if matches!(ch, '$' | '^' | '_') {
+            highlighted.push_str(&magenta(&ch.to_string()));
+            index += 1;
+        } else {
+            highlighted.push(ch);
+            index += 1;
+        }
+    }
+    highlighted
+}
+
+fn pad_ansi(value: &str, width: usize) -> String {
+    let visible = visible_width(value);
+    if visible >= width {
+        return value.to_string();
+    }
+    format!("{value}{}", " ".repeat(width - visible))
+}
+
+fn visible_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for ch in value.chars() {
+        if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 fn print_queue_status(status: &DownloadQueueStatusResponse) {
@@ -642,6 +1049,26 @@ fn yellow(value: &str) -> String {
 
 fn red(value: &str) -> String {
     color(31, value)
+}
+
+fn magenta(value: &str) -> String {
+    color(35, value)
+}
+
+fn dim(value: &str) -> String {
+    style("2", value)
+}
+
+fn italic(value: &str) -> String {
+    style("3", value)
+}
+
+fn keyword_hit(value: &str) -> String {
+    style("1;4;33", value)
+}
+
+fn style(code: &str, value: &str) -> String {
+    format!("\x1b[{code}m{value}\x1b[0m")
 }
 
 fn color(code: u8, value: &str) -> String {
