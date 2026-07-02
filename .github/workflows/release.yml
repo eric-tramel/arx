@@ -180,5 +180,5 @@ jobs:
           git push --force origin "$branch"
           gh pr create --repo "$TAP_REPO" ${draft_args[@]+"${draft_args[@]}"} \
             --title "arx ${TAG_NAME#v}" \
-            --body "Automated bump for ${GITHUB_REPOSITORY} release ${TAG_NAME}. Once brew test-bot is green, run the brew pr-pull workflow with this PR number to publish bottles." \
+            --body "Automated bump for ${GITHUB_REPOSITORY} release ${TAG_NAME}. Bottles are built by brew test-bot and published automatically by the brew pr-pull workflow once checks pass." \
             --head "$branch" --base main
