@@ -89,6 +89,11 @@ cargo run -p arx -- fetch 0704.0001
 cargo run -p arx-mcp -- serve
 ```
 
+Development builds run `rustc` through `sccache` via `.cargo/config.toml`, so
+dependency compilation artifacts are reused across worktrees instead of being
+rebuilt per checkout. Install `sccache` once before running Cargo commands
+locally; GitHub Actions installs it for release/test jobs.
+
 `arx-mcp serve` is the default MCP command, so an MCP client can launch `arx-mcp` with no arguments or with `serve`. `arx-mcp` starts `arxd` when a tool needs daemon work.
 
 ## Standalone CLI usage
