@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 pub const APP_CACHE_DIR: &str = "arx";
 
@@ -41,20 +44,24 @@ pub fn paper_cache_dir(cache_root: impl Into<PathBuf>, arxiv_id: &str) -> PathBu
         .join(safe_arxiv_id(arxiv_id))
 }
 
-pub fn metadata_db_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+pub fn metadata_db_path(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("metadata.sqlite3")
 }
 
-pub fn search_index_dir(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+pub fn search_index_dir(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("search-index")
 }
 
-pub fn arxd_state_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+pub fn arxd_state_path(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("arxd.json")
 }
 
-pub fn arxd_lock_path(cache_root: impl AsRef<std::path::Path>) -> PathBuf {
+pub fn arxd_lock_path(cache_root: impl AsRef<Path>) -> PathBuf {
     cache_root.as_ref().join("arxd.lock")
+}
+
+pub fn arxd_log_path(cache_root: impl AsRef<Path>) -> PathBuf {
+    cache_root.as_ref().join("arxd.log")
 }
 
 #[cfg(test)]
@@ -77,5 +84,6 @@ mod tests {
         assert_eq!(metadata_db_path(&root), root.join("metadata.sqlite3"));
         assert_eq!(arxd_state_path(&root), root.join("arxd.json"));
         assert_eq!(arxd_lock_path(&root), root.join("arxd.lock"));
+        assert_eq!(arxd_log_path(&root), root.join("arxd.log"));
     }
 }
