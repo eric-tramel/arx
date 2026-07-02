@@ -1,0 +1,20 @@
+{
+  "name": "arx",
+  "interface": {
+    "displayName": "arx"
+  },
+  "plugins": [
+    {
+      "name": "arx",
+      "source": {
+        "source": "local",
+        "path": "./plugins/arx"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

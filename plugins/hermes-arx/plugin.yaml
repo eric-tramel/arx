@@ -1,0 +1,11 @@
+manifest_version: 1
+name: arx
+version: "0.1.1"
+description: "Hermes integration for arx MCP paper metadata lookup, paper downloads, full-text search, and setup."
+author: "Eric Tramel"
+provides_commands:
+  - arx
+provides_skills:
+  - arx-paper-metadata
+  - arx-paper-fetch
+  - arx-full-text-search

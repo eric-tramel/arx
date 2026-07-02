@@ -1,0 +1,23 @@
+{
+  "name": "arx",
+  "version": "0.1.1",
+  "displayName": "arx",
+  "description": "Claude Code plugin for using arx MCP and skills to work with locally cached arXiv papers.",
+  "author": {
+    "name": "Eric Tramel",
+    "email": "eric.tramel@gmail.com"
+  },
+  "homepage": "https://github.com/eric-tramel/arx",
+  "repository": "https://github.com/eric-tramel/arx",
+  "license": "MIT",
+  "keywords": [
+    "arx",
+    "arxiv",
+    "mcp",
+    "papers",
+    "research",
+    "agent-skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.claude-mcp.json"
+}
