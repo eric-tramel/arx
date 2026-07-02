@@ -3,11 +3,11 @@ use arx_core::{
     arxiv::{ArxivFetcher, FetchPaperRequest, FetchPaperResponse, normalize_arxiv_id},
     daemon::{
         ArxdEndpoint, ArxdRequest, ArxdResponse, DownloadJobState, DownloadJobStatus,
-        DownloadQueueStatusRequest, DownloadQueueStatusResponse, QueuedFetchResponse,
-        remove_endpoint, unix_ms, write_endpoint,
+        DownloadQueueStatusRequest, DownloadQueueStatusResponse, MAX_PERSISTED_FINISHED_JOBS,
+        QueuedFetchResponse, read_finished_jobs, remove_endpoint, unix_ms, write_endpoint,
+        write_finished_jobs,
     },
     paths::{arxd_lock_path, arxd_log_path, xdg_cache_root},
-    rate_limit::ARXIV_DELAY,
 };
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -75,6 +75,9 @@ struct DownloadQueue {
 struct QueueState {
     next_job_id: u64,
     jobs: Vec<DownloadJob>,
+    /// Finished job records loaded from disk at startup (prior runs).
+    /// These are prepended to queue status responses when `include_finished` is set.
+    persisted_finished: Vec<DownloadJobStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +89,6 @@ struct DownloadJob {
     queued_at_unix_ms: u64,
     started_at_unix_ms: Option<u64>,
     finished_at_unix_ms: Option<u64>,
-    estimated_network_requests: u64,
     result: Option<FetchPaperResponse>,
     error: Option<String>,
 }
@@ -257,7 +259,8 @@ impl ArxdDaemon {
             .with_context(|| format!("creating cache root {}", cache_root.display()))?;
         let lock_file = acquire_daemon_lock(&cache_root)?;
         let fetcher = Arc::new(ArxivFetcher::new(cache_root.clone())?);
-        let queue = DownloadQueue::new(fetcher.clone());
+        let persisted_finished = read_finished_jobs(&cache_root);
+        let queue = DownloadQueue::new(fetcher.clone(), persisted_finished);
         let active_requests = Arc::new(AtomicUsize::new(0));
         Ok(Self {
             cache_root,
@@ -298,6 +301,11 @@ impl ArxdDaemon {
             }
         }
 
+        // Persist finished jobs so a restarted arxd can still return them.
+        let finished_to_persist = self.queue.finished_jobs_for_persistence().await;
+        if let Err(error) = write_finished_jobs(&self.cache_root, &finished_to_persist) {
+            tracing::warn!(?error, "failed to persist finished jobs on shutdown");
+        }
         remove_endpoint(&self.cache_root)?;
         self.lock_file.unlock().context("unlocking arxd lock")?;
         tracing::info!(cache_root = %self.cache_root.display(), "arxd idle shutdown");
@@ -325,18 +333,20 @@ impl Drop for ActiveRequestGuard {
     }
 }
 impl DownloadQueue {
-    fn new(fetcher: Arc<ArxivFetcher>) -> Self {
+    fn new(fetcher: Arc<ArxivFetcher>, persisted_finished: Vec<DownloadJobStatus>) -> Self {
         Self {
             fetcher,
             semaphore: Arc::new(Semaphore::new(DOWNLOAD_WORKERS)),
-            state: Arc::new(Mutex::new(QueueState::default())),
+            state: Arc::new(Mutex::new(QueueState {
+                persisted_finished,
+                ..QueueState::default()
+            })),
         }
     }
 
     async fn enqueue(&self, request: FetchPaperRequest) -> Result<QueuedFetchResponse> {
         let arxiv_id = normalize_arxiv_id(&request.arxiv_id)?;
         let queued_at_unix_ms = unix_ms();
-        let estimated_network_requests = estimated_network_requests(&request);
         let job_id = {
             let mut state = self.state.lock().await;
             state.next_job_id += 1;
@@ -349,7 +359,6 @@ impl DownloadQueue {
                 queued_at_unix_ms,
                 started_at_unix_ms: None,
                 finished_at_unix_ms: None,
-                estimated_network_requests,
                 result: None,
                 error: None,
             });
@@ -374,8 +383,6 @@ impl DownloadQueue {
             status: job.status,
             queue_position: job.queue_position.unwrap_or(0),
             queued_at_unix_ms,
-            estimated_seconds_until_start: job.estimated_seconds_until_start,
-            estimated_seconds_remaining: job.estimated_seconds_remaining,
             status_tool: STATUS_TOOL_NAME.to_string(),
             message: format!(
                 "queued arXiv download; call {STATUS_TOOL_NAME} with this job_id to check progress"
@@ -386,27 +393,47 @@ impl DownloadQueue {
     async fn status(&self, request: DownloadQueueStatusRequest) -> DownloadQueueStatusResponse {
         let now_unix_ms = unix_ms();
         let include_finished = request.include_finished.unwrap_or(true);
-        let jobs = {
+        let (live_jobs, persisted_finished) = {
             let state = self.state.lock().await;
-            state.jobs.clone()
+            (state.jobs.clone(), state.persisted_finished.clone())
         };
-        let queued_count = jobs
+        let queued_count = live_jobs
             .iter()
             .filter(|job| job.status == DownloadJobState::Queued)
             .count();
-        let in_progress_count = jobs
+        let in_progress_count = live_jobs
             .iter()
             .filter(|job| job.status == DownloadJobState::InProgress)
             .count();
-        let completed_count = jobs
+        // Count completed/failed from live jobs; persisted are already in terminal state.
+        let live_completed_count = live_jobs
             .iter()
             .filter(|job| job.status == DownloadJobState::Completed)
             .count();
-        let failed_count = jobs
+        let live_failed_count = live_jobs
             .iter()
             .filter(|job| job.status == DownloadJobState::Failed)
             .count();
-        let jobs = queue_statuses(&jobs, now_unix_ms, DOWNLOAD_WORKERS)
+        // Persisted finished that are NOT shadowed by a live job with the same job_id.
+        let live_job_ids: std::collections::HashSet<&str> =
+            live_jobs.iter().map(|j| j.job_id.as_str()).collect();
+        let persisted_not_shadowed: Vec<&DownloadJobStatus> = persisted_finished
+            .iter()
+            .filter(|j| !live_job_ids.contains(j.job_id.as_str()))
+            .collect();
+        let persisted_completed_count = persisted_not_shadowed
+            .iter()
+            .filter(|j| j.status == DownloadJobState::Completed)
+            .count();
+        let persisted_failed_count = persisted_not_shadowed
+            .iter()
+            .filter(|j| j.status == DownloadJobState::Failed)
+            .count();
+        let completed_count = live_completed_count + persisted_completed_count;
+        let failed_count = live_failed_count + persisted_failed_count;
+
+        let live_statuses = queue_statuses(&live_jobs, now_unix_ms, DOWNLOAD_WORKERS);
+        let mut jobs: Vec<DownloadJobStatus> = live_statuses
             .into_iter()
             .filter(|job| {
                 let matches_requested_job = request
@@ -423,6 +450,20 @@ impl DownloadQueue {
             })
             .collect();
 
+        // Append matching persisted finished jobs (not shadowed by live).
+        if include_finished {
+            for persisted_job in persisted_not_shadowed {
+                let matches_requested_job = request
+                    .job_id
+                    .as_ref()
+                    .map(|job_id| &persisted_job.job_id == job_id)
+                    .unwrap_or(true);
+                if matches_requested_job {
+                    jobs.push(persisted_job.clone());
+                }
+            }
+        }
+
         DownloadQueueStatusResponse {
             now_unix_ms,
             max_active_workers: DOWNLOAD_WORKERS,
@@ -432,6 +473,39 @@ impl DownloadQueue {
             failed_count,
             jobs,
         }
+    }
+
+    /// Collect all finished jobs (live + persisted, deduplicated) for persistence on shutdown.
+    async fn finished_jobs_for_persistence(&self) -> Vec<DownloadJobStatus> {
+        let now_unix_ms = unix_ms();
+        let (live_jobs, persisted_finished) = {
+            let state = self.state.lock().await;
+            (state.jobs.clone(), state.persisted_finished.clone())
+        };
+        let live_statuses = queue_statuses(&live_jobs, now_unix_ms, DOWNLOAD_WORKERS);
+        let live_job_ids: std::collections::HashSet<&str> =
+            live_jobs.iter().map(|j| j.job_id.as_str()).collect();
+
+        // Start with persisted jobs that weren't re-run this session (not shadowed).
+        let mut combined: Vec<DownloadJobStatus> = persisted_finished
+            .into_iter()
+            .filter(|j| !live_job_ids.contains(j.job_id.as_str()))
+            .collect();
+        // Add live finished jobs.
+        for job in live_statuses {
+            if matches!(
+                job.status,
+                DownloadJobState::Completed | DownloadJobState::Failed
+            ) {
+                combined.push(job);
+            }
+        }
+        // Sort by finished_at to produce a deterministic order; missing = 0 (shouldn't happen).
+        combined.sort_by_key(|j| j.finished_at_unix_ms.unwrap_or(0));
+        // Retain only the most recent MAX_PERSISTED_FINISHED_JOBS.
+        let len = combined.len();
+        let start = len.saturating_sub(MAX_PERSISTED_FINISHED_JOBS);
+        combined[start..].to_vec()
     }
 
     async fn has_work(&self) -> bool {
@@ -583,38 +657,22 @@ async fn finish_job(
 fn queue_statuses(
     jobs: &[DownloadJob],
     now_unix_ms: u64,
-    max_active_workers: usize,
+    _max_active_workers: usize,
 ) -> Vec<DownloadJobStatus> {
-    let worker_count = max_active_workers.max(1);
-    let mut worker_available_after = vec![0_u64; worker_count];
     let mut queued_position = 0;
     jobs.iter()
         .map(|job| {
-            let estimated_total = estimated_total_seconds(job.estimated_network_requests);
             let elapsed = job.started_at_unix_ms.map(|started| {
                 seconds_between(started, job.finished_at_unix_ms.unwrap_or(now_unix_ms))
             });
-            let (queue_position, estimated_seconds_until_start, estimated_seconds_remaining) =
-                match job.status {
-                    DownloadJobState::InProgress => {
-                        let elapsed = elapsed.unwrap_or(0);
-                        let remaining = estimated_total.saturating_sub(elapsed);
-                        let worker_index = next_available_worker(&worker_available_after);
-                        worker_available_after[worker_index] =
-                            worker_available_after[worker_index].saturating_add(remaining);
-                        (None, 0, remaining)
-                    }
-                    DownloadJobState::Queued => {
-                        queued_position += 1;
-                        let worker_index = next_available_worker(&worker_available_after);
-                        let until_start = worker_available_after[worker_index];
-                        let remaining = until_start.saturating_add(estimated_total);
-                        worker_available_after[worker_index] =
-                            worker_available_after[worker_index].saturating_add(estimated_total);
-                        (Some(queued_position), until_start, remaining)
-                    }
-                    DownloadJobState::Completed | DownloadJobState::Failed => (None, 0, 0),
-                };
+            let queue_position = match job.status {
+                DownloadJobState::InProgress => None,
+                DownloadJobState::Queued => {
+                    queued_position += 1;
+                    Some(queued_position)
+                }
+                DownloadJobState::Completed | DownloadJobState::Failed => None,
+            };
 
             DownloadJobStatus {
                 job_id: job.job_id.clone(),
@@ -624,9 +682,6 @@ fn queue_statuses(
                 queued_at_unix_ms: job.queued_at_unix_ms,
                 started_at_unix_ms: job.started_at_unix_ms,
                 finished_at_unix_ms: job.finished_at_unix_ms,
-                estimated_network_requests: job.estimated_network_requests,
-                estimated_seconds_until_start,
-                estimated_seconds_remaining,
                 elapsed_seconds: elapsed,
                 request: job.request.clone(),
                 result: job.result.clone(),
@@ -634,27 +689,6 @@ fn queue_statuses(
             }
         })
         .collect()
-}
-
-fn next_available_worker(worker_available_after: &[u64]) -> usize {
-    worker_available_after
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, available_after)| *available_after)
-        .map(|(index, _)| index)
-        .unwrap_or(0)
-}
-
-fn estimated_network_requests(request: &FetchPaperRequest) -> u64 {
-    let include_pdf = request.include_pdf.unwrap_or(true) as u64;
-    let include_source = request.include_source.unwrap_or(true) as u64;
-    1 + include_pdf + include_source
-}
-
-fn estimated_total_seconds(estimated_network_requests: u64) -> u64 {
-    estimated_network_requests
-        .saturating_mul(ARXIV_DELAY.as_secs())
-        .max(1)
 }
 
 fn seconds_between(start_unix_ms: u64, end_unix_ms: u64) -> u64 {
@@ -762,7 +796,6 @@ mod tests {
             jobs: vec![DownloadJob {
                 job_id: "download-1".to_string(),
                 arxiv_id: "2401.12345".to_string(),
-                estimated_network_requests: estimated_network_requests(&request),
                 request,
                 status: DownloadJobState::InProgress,
                 queued_at_unix_ms: unix_ms(),
@@ -771,6 +804,7 @@ mod tests {
                 result: None,
                 error: None,
             }],
+            ..QueueState::default()
         }));
         let handle: JoinHandle<WorkerResult> = tokio::spawn(async {
             panic!("worker panic regression sentinel");
@@ -801,7 +835,6 @@ mod tests {
             jobs: vec![DownloadJob {
                 job_id: "download-1".to_string(),
                 arxiv_id: "2401.12345".to_string(),
-                estimated_network_requests: estimated_network_requests(&request),
                 request,
                 status: DownloadJobState::InProgress,
                 queued_at_unix_ms: unix_ms(),
@@ -810,6 +843,7 @@ mod tests {
                 result: None,
                 error: None,
             }],
+            ..QueueState::default()
         }));
         let url = "http://127.0.0.1:31337/pdf/2401.12345";
         let handle: JoinHandle<WorkerResult> = tokio::spawn(async move {
@@ -838,5 +872,196 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("error decoding response body"), "{error}");
+    }
+
+    fn make_finished_job_status(
+        job_id: &str,
+        arxiv_id: &str,
+        state: DownloadJobState,
+        finished_at_unix_ms: u64,
+    ) -> DownloadJobStatus {
+        use arx_core::arxiv::FetchPaperRequest;
+        DownloadJobStatus {
+            job_id: job_id.to_string(),
+            arxiv_id: arxiv_id.to_string(),
+            status: state,
+            queue_position: None,
+            queued_at_unix_ms: finished_at_unix_ms.saturating_sub(5_000),
+            started_at_unix_ms: Some(finished_at_unix_ms.saturating_sub(3_000)),
+            finished_at_unix_ms: Some(finished_at_unix_ms),
+            elapsed_seconds: Some(3),
+            request: FetchPaperRequest {
+                arxiv_id: arxiv_id.to_string(),
+                include_pdf: Some(false),
+                include_source: Some(false),
+                refresh: Some(false),
+            },
+            result: None,
+            error: if state == DownloadJobState::Failed {
+                Some("simulated failure".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_jobs_are_returned_after_simulated_restart() {
+        // Simulate a prior run: two finished jobs are loaded as persisted_finished.
+        let persisted = vec![
+            make_finished_job_status(
+                "download-1",
+                "2401.00001",
+                DownloadJobState::Completed,
+                1_000,
+            ),
+            make_finished_job_status("download-2", "2401.00002", DownloadJobState::Failed, 2_000),
+        ];
+        let fetcher = Arc::new(
+            arx_core::arxiv::ArxivFetcher::new(tempfile::tempdir().unwrap().keep()).unwrap(),
+        );
+        let queue = DownloadQueue::new(fetcher, persisted.clone());
+
+        // Query with include_finished = true — should see both persisted jobs.
+        let status = queue
+            .status(DownloadQueueStatusRequest {
+                job_id: None,
+                include_finished: Some(true),
+            })
+            .await;
+        assert_eq!(status.completed_count, 1);
+        assert_eq!(status.failed_count, 1);
+        assert_eq!(status.jobs.len(), 2);
+        let ids: Vec<&str> = status.jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert!(
+            ids.contains(&"download-1"),
+            "expected download-1 in {ids:?}"
+        );
+        assert!(
+            ids.contains(&"download-2"),
+            "expected download-2 in {ids:?}"
+        );
+
+        // Query with include_finished = false — persisted jobs should be omitted.
+        let status_no_finished = queue
+            .status(DownloadQueueStatusRequest {
+                job_id: None,
+                include_finished: Some(false),
+            })
+            .await;
+        assert_eq!(status_no_finished.jobs.len(), 0);
+
+        // Per-id lookup for a persisted job.
+        let single = queue
+            .status(DownloadQueueStatusRequest {
+                job_id: Some("download-1".to_string()),
+                include_finished: Some(true),
+            })
+            .await;
+        assert_eq!(single.jobs.len(), 1);
+        assert_eq!(single.jobs[0].arxiv_id, "2401.00001");
+        assert_eq!(single.jobs[0].status, DownloadJobState::Completed);
+    }
+
+    #[tokio::test]
+    async fn finished_jobs_for_persistence_prunes_to_max_and_deduplicates() {
+        use arx_core::daemon::MAX_PERSISTED_FINISHED_JOBS;
+        // Build more jobs than the cap.
+        let count = MAX_PERSISTED_FINISHED_JOBS + 10;
+        let mut persisted = Vec::new();
+        for i in 0..count {
+            persisted.push(make_finished_job_status(
+                &format!("download-{i}"),
+                &format!("2401.{i:05}"),
+                DownloadJobState::Completed,
+                i as u64 * 1_000,
+            ));
+        }
+        let fetcher = Arc::new(
+            arx_core::arxiv::ArxivFetcher::new(tempfile::tempdir().unwrap().keep()).unwrap(),
+        );
+        let queue = DownloadQueue::new(fetcher, persisted);
+
+        let to_persist = queue.finished_jobs_for_persistence().await;
+        assert_eq!(
+            to_persist.len(),
+            MAX_PERSISTED_FINISHED_JOBS,
+            "should be capped at MAX_PERSISTED_FINISHED_JOBS"
+        );
+        // Should be the most recent MAX jobs (highest finished_at_unix_ms).
+        let min_expected_ts = (count - MAX_PERSISTED_FINISHED_JOBS) as u64 * 1_000;
+        assert!(
+            to_persist
+                .iter()
+                .all(|j| j.finished_at_unix_ms.unwrap_or(0) >= min_expected_ts),
+            "only most recent jobs should be kept"
+        );
+    }
+
+    #[test]
+    fn write_and_read_finished_jobs_round_trips() {
+        use arx_core::daemon::{read_finished_jobs, write_finished_jobs};
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path();
+
+        let jobs = vec![
+            make_finished_job_status(
+                "download-1",
+                "2401.00001",
+                DownloadJobState::Completed,
+                1_000,
+            ),
+            make_finished_job_status("download-2", "2401.00002", DownloadJobState::Failed, 2_000),
+        ];
+
+        write_finished_jobs(cache_root, &jobs).unwrap();
+        let loaded = read_finished_jobs(cache_root);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].job_id, "download-1");
+        assert_eq!(loaded[0].status, DownloadJobState::Completed);
+        assert_eq!(loaded[1].job_id, "download-2");
+        assert_eq!(loaded[1].status, DownloadJobState::Failed);
+        assert_eq!(loaded[1].error.as_deref(), Some("simulated failure"));
+    }
+
+    #[test]
+    fn read_finished_jobs_returns_empty_on_missing_file() {
+        use arx_core::daemon::read_finished_jobs;
+        let temp = tempfile::tempdir().unwrap();
+        let loaded = read_finished_jobs(temp.path());
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn write_finished_jobs_prunes_to_max_on_disk() {
+        use arx_core::daemon::{
+            MAX_PERSISTED_FINISHED_JOBS, read_finished_jobs, write_finished_jobs,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path();
+        let count = MAX_PERSISTED_FINISHED_JOBS + 5;
+        let jobs: Vec<DownloadJobStatus> = (0..count)
+            .map(|i| {
+                make_finished_job_status(
+                    &format!("download-{i}"),
+                    &format!("2401.{i:05}"),
+                    DownloadJobState::Completed,
+                    i as u64 * 1_000,
+                )
+            })
+            .collect();
+
+        write_finished_jobs(cache_root, &jobs).unwrap();
+        let loaded = read_finished_jobs(cache_root);
+        assert_eq!(
+            loaded.len(),
+            MAX_PERSISTED_FINISHED_JOBS,
+            "file should hold at most MAX_PERSISTED_FINISHED_JOBS entries"
+        );
+        // Should be the last (most recent) entries.
+        assert_eq!(
+            loaded[0].job_id,
+            format!("download-{}", count - MAX_PERSISTED_FINISHED_JOBS)
+        );
     }
 }

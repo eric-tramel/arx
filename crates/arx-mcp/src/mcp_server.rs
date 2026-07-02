@@ -81,7 +81,7 @@ impl ArxMcpServer {
 
     #[tool(
         name = "get_arxiv_download_queue_status",
-        description = "Ask arxd for queued, in-progress, completed, and failed arXiv download jobs with rough seconds-remaining estimates. Pass a job_id to inspect one download."
+        description = "Ask arxd for queued, in-progress, completed, and failed arXiv download jobs. Finished job records (completed/failed) are durable across arxd restarts — pass include_finished:true to see them. Pass a job_id to inspect one download."
     )]
     pub async fn get_arxiv_download_queue_status(
         &self,
@@ -103,7 +103,7 @@ impl ServerHandler for ArxMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "arx MCP grounds agents in locally cached arXiv papers. Start with lookup_arxiv_papers: it returns metadata, abstract, local material readiness, and cache paths, fetching only missing metadata. Use full_text_search for BM25-ranked snippets across all cached papers, or scoped to one paper with arxiv_id; the search index maintains itself. Use fetch_arxiv_paper only when needed PDF/source material is missing; it queues arxd work and returns a job id immediately, and get_arxiv_download_queue_status tracks the job. arxd enforces the cross-process arXiv request delay and shuts down after its queue is idle."
+                "arx MCP grounds agents in locally cached arXiv papers. Start with lookup_arxiv_papers: it returns metadata, abstract, local material readiness, and cache paths, fetching only missing metadata. Use full_text_search for BM25-ranked snippets across all cached papers, or scoped to one paper with arxiv_id; the search index maintains itself. Use fetch_arxiv_paper only when needed PDF/source material is missing; it queues arxd work and returns a job id immediately. Use get_arxiv_download_queue_status with include_finished:true to track jobs — completed and failed records are durable across arxd restarts, so a single poll after arxd exits is sufficient to confirm prior downloads. arxd enforces the cross-process arXiv request delay and shuts down after its queue is idle."
                     .to_string(),
             ),
         }
