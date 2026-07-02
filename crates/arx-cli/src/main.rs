@@ -76,6 +76,11 @@ enum Command {
         arxiv_id: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(
+            long,
+            help = "Search scope: default (title+metadata+body), titles, bibliography, all"
+        )]
+        scope: Option<String>,
     },
     #[command(about = "Show arxd download queue status")]
     QueueStatus {
@@ -176,11 +181,13 @@ async fn main() -> Result<()> {
             query,
             arxiv_id,
             limit,
+            scope,
         } => {
             let response = fetcher.full_text_search(FullTextSearchRequest {
                 query: query.join(" "),
                 arxiv_id,
                 limit: Some(limit),
+                scope,
             })?;
             if json {
                 print_json(&response)?;
@@ -445,10 +452,14 @@ fn print_index_report(report: &IndexReport) {
 fn print_search_response(response: &FullTextSearchResponse) {
     if response.results.is_empty() {
         println!(
-            "{} no matches in {} indexed chunks (run `arx index` to refresh the index)",
+            "{} no matches in {} indexed chunks (scope: {})",
             yellow("empty"),
-            response.indexed_chunks
+            response.indexed_chunks,
+            response.scope
         );
+        if let Some(note) = &response.note {
+            println!("{} {}", yellow("note:"), note);
+        }
         return;
     }
     for result in &response.results {

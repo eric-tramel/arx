@@ -52,7 +52,7 @@ impl ArxMcpServer {
 
     #[tool(
         name = "full_text_search",
-        description = "BM25-ranked full-text search over locally cached arXiv material (metadata, citations, and TeX/source paragraphs). Searches every cached paper by default; pass arxiv_id to restrict to one paper. Returns best-first snippets with scores, arXiv ids, source paths, and line ranges. The index maintains itself; this never contacts arXiv."
+        description = "BM25-ranked full-text search over locally cached arXiv material. Scope controls which content is searched: scope=default (or omit) searches title+metadata+body and EXCLUDES bibliography; scope=titles searches title only; scope=bibliography searches citation records and .bib/.bbl files only; scope=all searches everything. Searches every cached paper by default; pass arxiv_id to restrict to one paper. Returns best-first snippets with scores, arXiv ids, source paths, and line ranges. Empty results include a note field explaining why and what to do next. The index maintains itself; this never contacts arXiv."
     )]
     pub fn full_text_search(
         &self,

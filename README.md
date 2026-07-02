@@ -34,7 +34,7 @@ crates/
   - `arxd serve`: owns the per-cache-root queue and database updates; frontends start it automatically.
 - MCP stdio server with four tools:
   - `lookup_arxiv_papers`: metadata, abstract, local material readiness, and cache paths; fetches only missing metadata.
-  - `full_text_search`: BM25-ranked search over cached material for all papers, or one paper via `arxiv_id`; the index maintains itself.
+  - `full_text_search`: BM25-ranked search over cached material for all papers, or one paper via `arxiv_id`. Scope controls which content is searched: `default` (title+metadata+body, no bibliography), `titles`, `bibliography`, `all`. Empty results include a `note` explaining why.
   - `fetch_arxiv_paper`: ask arxd to queue/cache a paper (PDF/source) and return a job id immediately.
   - `get_arxiv_download_queue_status`: inspect queued, active, completed, and failed downloads.
 - Downloads arXiv metadata, PDF, and source/e-print bundle.
@@ -160,7 +160,18 @@ without network access:
 arx search reward model training
 arx search "mixture of experts" --limit 5
 arx search calibration --arxiv-id 0704.0001
+arx search attention --scope titles          # title-only (find papers by name)
+arx search vaswani --scope bibliography      # search citation records and .bib files
 ```
+
+By default the search scope is `default`, which covers titles, metadata
+(abstract, authors, categories), and TeX/source body paragraphs. Bibliography
+content (.bib, .bbl files and citation records) is **excluded** from the
+default scope to prevent hits in one paper's reference list from polluting
+searches for papers *about* a topic. Use `--scope bibliography` to search
+bibliography content explicitly, or `--scope all` for everything. When results
+are empty, the `note` field explains why and what to do next (e.g. fetch the
+TeX source to index the body).
 
 Locate cached files without network access:
 

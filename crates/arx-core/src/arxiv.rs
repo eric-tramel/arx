@@ -1,5 +1,5 @@
 use crate::{
-    material_index::{CorpusSearchResult, MaterialChunk, MaterialIndex},
+    material_index::{CorpusSearchResult, MaterialChunk, MaterialIndex, category},
     metadata_db::{IndexReport, MetadataDatabase},
     paths,
     rate_limit::RateLimiter,
@@ -233,6 +233,11 @@ pub struct FullTextSearchRequest {
     pub arxiv_id: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Search scope: \"default\" (title+metadata+body, no bibliography), \"titles\" (title only), \"bibliography\" (bibliography only), \"all\" (everything). Omitting scope is the same as \"default\"."
+    )]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -241,6 +246,15 @@ pub struct FullTextSearchResponse {
     #[schemars(description = "Total material chunks in the persistent index.")]
     pub indexed_chunks: u64,
     pub results: Vec<CorpusSearchResult>,
+    #[schemars(
+        description = "Effective search scope used for this query (default/titles/bibliography/all)."
+    )]
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Explanatory note when results are empty; describes why and what to do next."
+    )]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +389,20 @@ impl ArxivFetcher {
             .map(normalize_arxiv_id)
             .transpose()?
             .map(|arxiv_id| base_arxiv_id(&arxiv_id));
+
+        // Resolve and validate the scope.
+        let scope_str = request.scope.as_deref().unwrap_or("default");
+        let scope_categories: Option<Vec<&str>> = match scope_str {
+            "default" => Some(vec![category::TITLE, category::METADATA, category::BODY]),
+            "titles" => Some(vec![category::TITLE]),
+            "bibliography" => Some(vec![category::BIBLIOGRAPHY]),
+            "all" => None,
+            other => bail!(
+                "unknown scope {:?}; valid values are \"default\", \"titles\", \"bibliography\", \"all\"",
+                other
+            ),
+        };
+
         let index = MaterialIndex::open_or_create(&self.cache_root)?;
 
         match arxiv_id.as_deref() {
@@ -393,12 +421,57 @@ impl ArxivFetcher {
             }
         }
 
-        let results = index.search(&query_tokens, arxiv_id.as_deref(), limit)?;
+        let cats_ref: Option<&[&str]> = scope_categories.as_deref();
+        let results = index.search(&query_tokens, arxiv_id.as_deref(), cats_ref, limit)?;
+        let indexed_chunks = index.chunk_count()?;
+
+        // Build explanatory note when results are empty (P4).
+        let note = if results.is_empty() {
+            self.empty_results_note(arxiv_id.as_deref(), scope_str)
+        } else {
+            None
+        };
+
         Ok(FullTextSearchResponse {
             query: query.to_string(),
-            indexed_chunks: index.chunk_count()?,
+            indexed_chunks,
             results,
+            scope: scope_str.to_string(),
+            note,
         })
+    }
+
+    /// Construct a short diagnostic note explaining why a search returned no
+    /// results and what the caller should do next.
+    fn empty_results_note(&self, arxiv_id: Option<&str>, scope: &str) -> Option<String> {
+        if let Some(arxiv_id) = arxiv_id {
+            let paths = PaperPaths::new(&self.cache_root, arxiv_id);
+            if !paths.cache_dir.exists() {
+                return Some(format!(
+                    "paper {arxiv_id} is not cached; call fetch_arxiv_paper to download and index it"
+                ));
+            }
+            // Cache dir exists: check whether source material is present.
+            let manifest = read_or_infer_manifest(&paths).ok().flatten();
+            if !has_searchable_source_material(&paths, manifest.as_ref()) {
+                // Only metadata/abstract is indexed.
+                if scope != "default" && scope != "all" {
+                    return Some(format!(
+                        "only metadata/abstract are indexed for {arxiv_id} and scope is \"{scope}\"; fetch TeX source with fetch_arxiv_paper or use scope \"default\""
+                    ));
+                }
+                return Some(format!(
+                    "only metadata/abstract are indexed for {arxiv_id}; fetch TeX source with fetch_arxiv_paper to search the body"
+                ));
+            }
+        }
+        // Non-default scope note.
+        if scope != "default" {
+            return Some(format!(
+                "no results in scope \"{scope}\"; try scope \"default\" or \"all\" to widen the search"
+            ));
+        }
+        None
     }
 
     async fn fetch_inner(&self, request: FetchPaperRequest) -> Result<FetchPaperResponse> {
@@ -1159,32 +1232,45 @@ fn collect_metadata_candidates(
         return;
     };
     let metadata_path = display_path(metadata_path);
-    let mut push = |field: &'static str, value: Option<String>| {
-        if let Some(text) = value.filter(|text| !text.trim().is_empty()) {
-            candidates.push(MaterialChunk {
-                source: "metadata".to_string(),
-                field: Some(field.to_string()),
-                path: Some(metadata_path.clone()),
-                line_start: None,
-                line_end: None,
-                text,
-            });
-        }
-    };
-    push("title", metadata.title.clone());
-    push("abstract", metadata.summary.clone());
+    let mut push =
+        |field_name: &'static str, chunk_category: &'static str, value: Option<String>| {
+            if let Some(text) = value.filter(|text| !text.trim().is_empty()) {
+                candidates.push(MaterialChunk {
+                    source: "metadata".to_string(),
+                    category: chunk_category.to_string(),
+                    field: Some(field_name.to_string()),
+                    path: Some(metadata_path.clone()),
+                    line_start: None,
+                    line_end: None,
+                    text,
+                });
+            }
+        };
+    // Title is its own scope so agents can search titles only.
+    push("title", category::TITLE, metadata.title.clone());
+    push("abstract", category::METADATA, metadata.summary.clone());
     push(
         "authors",
+        category::METADATA,
         (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
     );
     push(
         "categories",
+        category::METADATA,
         (!metadata.categories.is_empty()).then(|| metadata.categories.join(", ")),
     );
-    push("primary_category", metadata.primary_category.clone());
-    push("comment", metadata.comment.clone());
-    push("journal_ref", metadata.journal_ref.clone());
-    push("doi", metadata.doi.clone());
+    push(
+        "primary_category",
+        category::METADATA,
+        metadata.primary_category.clone(),
+    );
+    push("comment", category::METADATA, metadata.comment.clone());
+    push(
+        "journal_ref",
+        category::METADATA,
+        metadata.journal_ref.clone(),
+    );
+    push("doi", category::METADATA, metadata.doi.clone());
 }
 
 fn collect_citation_candidates(
@@ -1201,6 +1287,11 @@ fn collect_citation_candidates(
             .with_context(|| format!("parsing citation JSONL {}", citations_path.display()))?;
         candidates.push(MaterialChunk {
             source: "citation".to_string(),
+            // Citation records are bibliography-scope: they describe cited papers
+            // extracted from .bib/.bbl files and TeX source. Excluding them from
+            // default search prevents "papers citing X" hits from polluting
+            // "papers about X" results.
+            category: category::BIBLIOGRAPHY.to_string(),
             field: Some("context".to_string()),
             path: Some(record.source_file.clone()),
             line_start: Some(record.line),
@@ -1238,6 +1329,10 @@ fn collect_source_candidates(
 /// Split a source file into paragraphs (runs of non-blank lines). Paragraphs
 /// are the ranking unit: TeX wraps sentences across lines, so line-level
 /// matching misses multi-term queries that paragraph-level scoring catches.
+///
+/// .bib and .bbl files are assigned to the `bibliography` category so they
+/// are excluded from default search scope and only found when the caller
+/// explicitly requests the bibliography scope.
 fn collect_source_file_candidates(path: &Path, candidates: &mut Vec<MaterialChunk>) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() > 5 * 1024 * 1024 {
@@ -1246,14 +1341,21 @@ fn collect_source_file_candidates(path: &Path, candidates: &mut Vec<MaterialChun
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(());
     };
+    let chunk_category = if is_bibliography_file(path) {
+        category::BIBLIOGRAPHY
+    } else {
+        category::BODY
+    };
+    let path_str = display_path(path);
     let mut paragraph: Vec<&str> = Vec::new();
     let mut paragraph_start = 0usize;
     let mut flush = |paragraph: &mut Vec<&str>, start: usize, end: usize| {
         if !paragraph.is_empty() {
             candidates.push(MaterialChunk {
                 source: "source".to_string(),
+                category: chunk_category.to_string(),
                 field: None,
-                path: Some(display_path(path)),
+                path: Some(path_str.clone()),
                 line_start: Some(start),
                 line_end: Some(end),
                 text: paragraph.join("\n"),
@@ -1279,6 +1381,13 @@ fn collect_source_file_candidates(path: &Path, candidates: &mut Vec<MaterialChun
     let line_count = text.lines().count();
     flush(&mut paragraph, paragraph_start, line_count);
     Ok(())
+}
+
+fn is_bibliography_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("bib" | "bbl")
+    )
 }
 
 fn source_search_roots(paths: &PaperPaths, manifest: Option<&SourceManifest>) -> Vec<PathBuf> {
@@ -2134,13 +2243,16 @@ mod tests {
 
         // The paper was never indexed explicitly: the scoped search must
         // notice the empty per-paper index and index it on the fly.
+        // Use scope "all" to see every category (title, metadata, body, bibliography).
         let response = fetcher.full_text_search(FullTextSearchRequest {
             query: "calibration".to_string(),
             arxiv_id: Some(arxiv_id.to_string()),
             limit: Some(10),
+            scope: Some("all".to_string()),
         })?;
 
         assert_eq!(response.query, "calibration");
+        assert_eq!(response.scope, "all");
         assert!(response.indexed_chunks > 0);
         assert!(
             response
@@ -2150,6 +2262,7 @@ mod tests {
         );
         assert!(response.results.iter().any(|result| {
             result.source == "metadata"
+                && result.category.as_deref() == Some("title")
                 && result.field.as_deref() == Some("title")
                 && result
                     .path
@@ -2157,8 +2270,10 @@ mod tests {
                     .is_some_and(|path| path.ends_with("metadata.json"))
                 && result.snippet.contains("Calibration theorem")
         }));
+        // Citation records are bibliography category and appear in "all" scope.
         assert!(response.results.iter().any(|result| {
             result.source == "citation"
+                && result.category.as_deref() == Some("bibliography")
                 && result
                     .path
                     .as_deref()
@@ -2166,8 +2281,10 @@ mod tests {
                 && result.line_start == Some(2)
                 && result.snippet.contains("Calibration citation")
         }));
+        // Source file paragraphs (body category) appear in "all" scope too.
         assert!(response.results.iter().any(|result| {
             result.source == "source"
+                && result.category.as_deref() == Some("body")
                 && result
                     .path
                     .as_deref()
@@ -2175,6 +2292,22 @@ mod tests {
                 && result.line_start == Some(2)
                 && result.snippet.contains("Calibration citation")
         }));
+
+        // Default scope excludes bibliography; citation chunks must not appear.
+        let default_response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(10),
+            scope: None,
+        })?;
+        assert_eq!(default_response.scope, "default");
+        assert!(
+            default_response
+                .results
+                .iter()
+                .all(|r| r.source != "citation"),
+            "default scope must not include citation (bibliography) chunks"
+        );
         Ok(())
     }
 
@@ -2195,6 +2328,7 @@ mod tests {
             query: "calibration".to_string(),
             arxiv_id: None,
             limit: Some(10),
+            scope: None,
         })?;
         assert!(response.indexed_chunks > 0);
         assert!(!response.results.is_empty());
@@ -2226,6 +2360,7 @@ mod tests {
             query: "stochastic gradient convergence".to_string(),
             arxiv_id: Some(arxiv_id.to_string()),
             limit: Some(10),
+            scope: None,
         })?;
 
         assert_eq!(response.results.len(), 3);
@@ -2284,6 +2419,7 @@ mod tests {
             query: "calibration stochastic solvers".to_string(),
             arxiv_id: None,
             limit: Some(10),
+            scope: None,
         })?;
         assert!(!response.results.is_empty());
         assert_eq!(response.results[0].arxiv_id, "2401.11111");
@@ -2295,6 +2431,7 @@ mod tests {
             query: "attention".to_string(),
             arxiv_id: Some("2401.22222v9".to_string()),
             limit: Some(10),
+            scope: None,
         })?;
         assert!(!filtered.results.is_empty());
         assert!(
@@ -2325,6 +2462,7 @@ mod tests {
             query: "calibration".to_string(),
             arxiv_id: None,
             limit: Some(100),
+            scope: None,
         })?;
         assert_eq!(response.indexed_chunks as usize, second);
         Ok(())
@@ -2350,6 +2488,7 @@ mod tests {
             query: "calibration".to_string(),
             arxiv_id: None,
             limit: Some(10),
+            scope: None,
         })?;
         assert!(response.results.is_empty());
         assert_eq!(response.indexed_chunks, 0);
@@ -2365,9 +2504,212 @@ mod tests {
                 query: "% $ x".to_string(),
                 arxiv_id: Some("2401.12345".to_string()),
                 limit: None,
+                scope: None,
             })
             .unwrap_err();
         assert!(error.to_string().contains("two or more characters"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_bibliography_scope_finds_bib_file_chunks_excluded_by_default() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+        // Bundle with both a .tex body file and a .bib bibliography file.
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            append_tar_file(
+                &mut builder,
+                "main.tex",
+                "The calibration algorithm is described in Section 2.
+",
+            )?;
+            append_tar_file(
+                &mut builder,
+                "refs.bib",
+                "@article{smith2020,
+  title={Calibration methods},
+  eprint={2001.00001},
+}
+",
+            )?;
+            builder.finish()?;
+        }
+        materialize_source(&paths, &bytes)?;
+        fetcher.index_paper_material(arxiv_id)?;
+
+        // Default scope must not return .bib file chunks.
+        let default_response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(20),
+            scope: None,
+        })?;
+        assert_eq!(default_response.scope, "default");
+        assert!(
+            default_response
+                .results
+                .iter()
+                .all(|r| !r.path.as_deref().is_some_and(|p| p.ends_with(".bib"))),
+            "default scope must not include .bib file chunks"
+        );
+
+        // bibliography scope must find chunks from refs.bib.
+        let bib_response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(20),
+            scope: Some("bibliography".to_string()),
+        })?;
+        assert_eq!(bib_response.scope, "bibliography");
+        assert!(
+            bib_response
+                .results
+                .iter()
+                .any(|r| r.path.as_deref().is_some_and(|p| p.ends_with(".bib"))),
+            "bibliography scope should find .bib file chunks"
+        );
+
+        // all scope returns both body and bibliography.
+        let all_response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(20),
+            scope: Some("all".to_string()),
+        })?;
+        assert_eq!(all_response.scope, "all");
+        assert!(
+            all_response
+                .results
+                .iter()
+                .any(|r| r.category.as_deref() == Some("body")),
+            "all scope should include body chunks"
+        );
+        assert!(
+            all_response
+                .results
+                .iter()
+                .any(|r| r.category.as_deref() == Some("bibliography")),
+            "all scope should include bibliography chunks"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_titles_scope_returns_title_chunks_only() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(
+                arxiv_id,
+                "Calibration theorem for stochastic systems",
+                "About calibration.",
+            ),
+        )?;
+        fetcher.index_paper_material(arxiv_id)?;
+
+        let response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration stochastic".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(10),
+            scope: Some("titles".to_string()),
+        })?;
+        assert_eq!(response.scope, "titles");
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|r| r.category.as_deref() == Some("title")),
+            "titles scope should return only title-category chunks"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_invalid_scope_returns_error() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let error = fetcher
+            .full_text_search(FullTextSearchRequest {
+                query: "calibration".to_string(),
+                arxiv_id: None,
+                limit: None,
+                scope: Some("unknown_scope".to_string()),
+            })
+            .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("unknown scope"),
+            "error should mention unknown scope: {msg}"
+        );
+        assert!(
+            msg.contains("default"),
+            "error should list valid scopes: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_empty_results_note_for_uncached_paper() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        // Paper 2401.99999 has never been cached.
+        let response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "calibration".to_string(),
+            arxiv_id: Some("2401.99999".to_string()),
+            limit: Some(10),
+            scope: None,
+        })?;
+        assert!(response.results.is_empty());
+        let note = response
+            .note
+            .expect("empty results for uncached paper should have a note");
+        assert!(
+            note.contains("fetch_arxiv_paper"),
+            "note should direct to fetch_arxiv_paper: {note}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_empty_results_note_for_metadata_only_paper() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        // Only metadata, no source files.
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+        fetcher.index_paper_material(arxiv_id)?;
+
+        // Query that won't match metadata but would match body if present.
+        let response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "zzznomatch".to_string(),
+            arxiv_id: Some(arxiv_id.to_string()),
+            limit: Some(10),
+            scope: None,
+        })?;
+        assert!(response.results.is_empty());
+        let note = response
+            .note
+            .expect("empty results for metadata-only paper should have a note");
+        assert!(
+            note.contains("fetch_arxiv_paper") || note.contains("metadata"),
+            "note should guide the agent: {note}"
+        );
         Ok(())
     }
 
