@@ -3,7 +3,7 @@ mod setup;
 
 use anyhow::{Context, Result};
 use arx_core::{arxiv::ArxivFetcher, paths::xdg_cache_root};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use mcp_server::ArxMcpServer;
 use rmcp::{ServiceExt, transport::stdio};
 use std::path::PathBuf;
@@ -12,7 +12,15 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(name = "arx-mcp")]
 #[command(about = "Stdio MCP server for cached arXiv paper retrieval")]
+#[command(version, disable_version_flag = true)]
 struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    _version: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }

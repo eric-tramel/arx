@@ -45,6 +45,7 @@ crates/
 - Keeps arxd connection state in `<cache-root>/arxd.json` and the daemon singleton lock in `<cache-root>/arxd.lock`.
 - Enforces a cross-process 3 second delay between arXiv requests.
 - Includes MCP setup helpers in `arx-mcp` so harnesses can launch the frontend directly from config.
+- All shipped command-line binaries (`arx`, `arxd`, and `arx-mcp`) support `--version` / `-v`.
 
 ## Install
 
@@ -69,7 +70,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/eric-tramel/arx/main/install.ps1 | iex
 ```
 
-The installers download the matching release archive and install both binaries: `arx` and `arx-mcp`.
+The installers download the matching release archive and install `arx`, `arxd`, and `arx-mcp`.
 
 Override defaults:
 

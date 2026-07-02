@@ -12,7 +12,7 @@ use arx_core::{
     metadata_db::IndexReport,
     paths::xdg_cache_root,
 };
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::{
     io::{self, IsTerminal},
@@ -25,7 +25,15 @@ const FETCH_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Parser)]
 #[command(name = "arx")]
 #[command(about = "Standalone CLI for cached arXiv paper retrieval")]
+#[command(version, disable_version_flag = true)]
 struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    _version: bool,
     #[arg(
         short = 'j',
         long,
