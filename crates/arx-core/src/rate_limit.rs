@@ -72,6 +72,34 @@ impl RateLimiter {
             .await
             .context("rate-limit lock task panicked")?
     }
+
+    /// Push the shared next-allowed time at least `penalty` into the future
+    /// so every arx process backs off — used when arXiv answers 429. Never
+    /// moves the next-allowed time earlier. Must not be called while this
+    /// process holds the rate-limit lock (i.e. from inside `run`'s closure).
+    pub async fn penalize(&self, penalty: Duration) -> Result<()> {
+        let lock_path = self.lock_path.clone();
+        let state_path = self.state_path.clone();
+        let delay = self.delay;
+        tokio::task::spawn_blocking(move || {
+            let guard = RateLimitGuard::acquire(lock_path, state_path.clone(), delay)?;
+            let state = read_state(&state_path)?;
+            let now = unix_ms()?;
+            let penalized = now.saturating_add(penalty.as_millis() as u64);
+            if penalized > state.next_allowed_unix_ms {
+                write_state(
+                    &state_path,
+                    &RateLimitState {
+                        next_allowed_unix_ms: penalized,
+                    },
+                )?;
+                tracing::info!(?penalty, "arXiv rate limited; extending shared backoff");
+            }
+            guard.release()
+        })
+        .await
+        .context("rate-limit penalty task panicked")?
+    }
 }
 
 struct RateLimitGuard {
@@ -213,6 +241,26 @@ mod tests {
         )?;
 
         assert!(guard.wait_duration()? > Duration::from_secs(50));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn penalize_extends_shared_backoff_without_shortening_it() -> Result<()> {
+        let temp = tempdir()?;
+        let limiter = RateLimiter::with_delay(temp.path(), Duration::ZERO);
+
+        limiter.penalize(Duration::from_secs(30)).await?;
+        let state = read_state(&limiter.state_path)?;
+        let now = unix_ms()?;
+        assert!(
+            state.next_allowed_unix_ms > now.saturating_add(25_000),
+            "penalty should push next-allowed ~30s out"
+        );
+
+        // A smaller penalty must not move the next-allowed time earlier.
+        limiter.penalize(Duration::from_secs(1)).await?;
+        let state_after = read_state(&limiter.state_path)?;
+        assert_eq!(state_after.next_allowed_unix_ms, state.next_allowed_unix_ms);
         Ok(())
     }
 

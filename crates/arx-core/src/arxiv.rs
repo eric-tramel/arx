@@ -23,6 +23,12 @@ const METADATA_URL: &str = "https://export.arxiv.org/api/query";
 /// Fail-fast bound on metadata requests. Applied per-request (not on the shared
 /// client) because PDF and source downloads legitimately take longer.
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff schedule for metadata retries on the queued download path.
+/// Interactive lookups never retry; background jobs wait these durations
+/// between attempts (attempts = waits + 1).
+const METADATA_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
+/// How long every arx process backs off after arXiv answers 429.
+const RATE_LIMIT_PENALTY: Duration = Duration::from_secs(30);
 
 static ARXIV_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?$")
@@ -51,6 +57,7 @@ pub struct ArxivFetcher {
     metadata_db: MetadataDatabase,
     metadata_url: String,
     metadata_timeout: Duration,
+    metadata_retry_waits: Vec<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -324,6 +331,7 @@ impl ArxivFetcher {
             client,
             metadata_url: METADATA_URL.to_string(),
             metadata_timeout: METADATA_REQUEST_TIMEOUT,
+            metadata_retry_waits: METADATA_RETRY_WAITS.to_vec(),
         })
     }
 
@@ -648,42 +656,62 @@ impl ArxivFetcher {
                     }
                 }
                 Err(batch_err) => {
-                    // Batch request failed — fall back to per-id requests so
-                    // good ids still succeed and failures are attributed individually.
-                    tracing::info!(
-                        error = %format!("{batch_err:#}"),
-                        "batched metadata request failed; retrying per-id"
-                    );
-                    for arxiv_id in &needs_metadata {
-                        let result = self
-                            .fetch_metadata_batch(std::slice::from_ref(arxiv_id))
-                            .await;
-                        network_requests += 1;
-                        match result {
-                            Ok(fetched) => {
-                                let fetched_by_id = metadata_lookup(fetched);
-                                match fetched_by_id
-                                    .get(arxiv_id)
-                                    .or_else(|| fetched_by_id.get(&base_arxiv_id(arxiv_id)))
-                                    .cloned()
-                                {
-                                    Some(metadata) => {
-                                        let paths = PaperPaths::new(&self.cache_root, arxiv_id);
-                                        write_json_pretty(&paths.metadata_path, &metadata)?;
-                                        self.metadata_db
-                                            .upsert_paper(&self.cache_root, &metadata)?;
-                                        fetched_metadata_count += 1;
-                                    }
-                                    None => {
-                                        per_id_errors.insert(
-                                            arxiv_id.clone(),
-                                            format!("arXiv returned no metadata for {arxiv_id}"),
-                                        );
+                    let batch_err_text = format!("{batch_err:#}");
+                    if is_systemic_metadata_error(&batch_err_text) {
+                        // Timeouts, rate limits, and server errors apply to
+                        // every id: retrying per-id would multiply requests
+                        // against an already-struggling arXiv (observed live:
+                        // a 15-id batch turned into 16 requests, 205s of wall
+                        // time, and deeper 429s). Attribute the batch error
+                        // to each uncached id and fail fast instead.
+                        tracing::info!(
+                            error = %batch_err_text,
+                            "batched metadata request failed systemically; not retrying per-id"
+                        );
+                        for arxiv_id in &needs_metadata {
+                            per_id_errors.insert(arxiv_id.clone(), batch_err_text.clone());
+                        }
+                    } else {
+                        // Plausibly id-specific failure — fall back to per-id
+                        // requests so good ids still succeed and failures are
+                        // attributed individually.
+                        tracing::info!(
+                            error = %batch_err_text,
+                            "batched metadata request failed; retrying per-id"
+                        );
+                        for arxiv_id in &needs_metadata {
+                            let result = self
+                                .fetch_metadata_batch(std::slice::from_ref(arxiv_id))
+                                .await;
+                            network_requests += 1;
+                            match result {
+                                Ok(fetched) => {
+                                    let fetched_by_id = metadata_lookup(fetched);
+                                    match fetched_by_id
+                                        .get(arxiv_id)
+                                        .or_else(|| fetched_by_id.get(&base_arxiv_id(arxiv_id)))
+                                        .cloned()
+                                    {
+                                        Some(metadata) => {
+                                            let paths = PaperPaths::new(&self.cache_root, arxiv_id);
+                                            write_json_pretty(&paths.metadata_path, &metadata)?;
+                                            self.metadata_db
+                                                .upsert_paper(&self.cache_root, &metadata)?;
+                                            fetched_metadata_count += 1;
+                                        }
+                                        None => {
+                                            per_id_errors.insert(
+                                                arxiv_id.clone(),
+                                                format!(
+                                                    "arXiv returned no metadata for {arxiv_id}"
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(err) => {
-                                per_id_errors.insert(arxiv_id.clone(), format!("{err:#}"));
+                                Err(err) => {
+                                    per_id_errors.insert(arxiv_id.clone(), format!("{err:#}"));
+                                }
                             }
                         }
                     }
@@ -883,17 +911,54 @@ impl ArxivFetcher {
         })
     }
 
+    /// Fetch metadata for one paper on the queued download path. Unlike
+    /// interactive lookups, background jobs should be patient: transient
+    /// arXiv slowness or rate limiting retries with backoff instead of
+    /// failing the job on the first 10s timeout (observed live: 14 queued
+    /// jobs failed on single timeouts and the agent bypassed arx entirely).
     async fn fetch_metadata(&self, arxiv_id: &str) -> Result<PaperMetadata> {
         let requested = arxiv_id.to_string();
-        let fetched = self
-            .fetch_metadata_batch(std::slice::from_ref(&requested))
-            .await?;
-        let fetched_by_id = metadata_lookup(fetched);
-        fetched_by_id
-            .get(&requested)
-            .or_else(|| fetched_by_id.get(&base_arxiv_id(&requested)))
-            .cloned()
-            .with_context(|| format!("arXiv metadata response did not contain {requested}"))
+        let mut last_error = None;
+        for (attempt, wait) in self
+            .metadata_retry_waits
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            match self
+                .fetch_metadata_batch(std::slice::from_ref(&requested))
+                .await
+            {
+                Ok(fetched) => {
+                    let fetched_by_id = metadata_lookup(fetched);
+                    return fetched_by_id
+                        .get(&requested)
+                        .or_else(|| fetched_by_id.get(&base_arxiv_id(&requested)))
+                        .cloned()
+                        .with_context(|| {
+                            format!("arXiv metadata response did not contain {requested}")
+                        });
+                }
+                Err(error) => {
+                    let error_text = format!("{error:#}");
+                    if !is_systemic_metadata_error(&error_text) {
+                        return Err(error);
+                    }
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        error = %error_text,
+                        "metadata fetch failed for queued download; will retry if attempts remain"
+                    );
+                    last_error = Some(error);
+                    if let Some(wait) = wait {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("at least one metadata fetch attempt"))
     }
 
     async fn fetch_metadata_batch(&self, arxiv_ids: &[String]) -> Result<Vec<PaperMetadata>> {
@@ -902,7 +967,7 @@ impl ArxivFetcher {
         }
         let id_list = arxiv_ids.join(",");
         let max_results = arxiv_ids.len().to_string();
-        let text = self
+        let request_result = self
             .rate_limiter
             .run(|| async {
                 let response = self
@@ -945,7 +1010,18 @@ impl ArxivFetcher {
                     }
                 })
             })
-            .await?;
+            .await;
+        let text = match request_result {
+            Ok(text) => text,
+            Err(error) => {
+                // Penalize outside run(): the rate-limit lock is released
+                // here, and penalize acquires it again.
+                if format!("{error:#}").contains("429") {
+                    self.rate_limiter.penalize(RATE_LIMIT_PENALTY).await?;
+                }
+                return Err(error);
+            }
+        };
         parse_metadata_feed(arxiv_ids, &text)
     }
 
@@ -971,6 +1047,9 @@ impl ArxivFetcher {
                 Err(error)
                     if attempt < DOWNLOAD_MAX_ATTEMPTS && should_retry_download_error(&error) =>
                 {
+                    if is_rate_limited_error(&error) {
+                        self.rate_limiter.penalize(RATE_LIMIT_PENALTY).await?;
+                    }
                     tracing::info!(
                         %url,
                         attempt,
@@ -1012,6 +1091,28 @@ impl ArxivFetcher {
             })
             .await
     }
+}
+
+/// True when a metadata failure is not specific to any single arXiv id —
+/// timeouts, rate limiting, connection failures, and server errors hit
+/// every id equally, so per-id fallbacks only multiply load while retries
+/// with backoff can help. Matches on the error strings this module
+/// produces (`map_metadata_error` and the status-check bail).
+fn is_systemic_metadata_error(error_text: &str) -> bool {
+    error_text.contains("timed out after")
+        || error_text.contains("429")
+        || error_text.contains("500")
+        || error_text.contains("502")
+        || error_text.contains("503")
+        || error_text.contains("requesting arXiv metadata")
+}
+
+fn is_rate_limited_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS))
+    })
 }
 
 fn should_retry_download_error(error: &anyhow::Error) -> bool {
@@ -3071,6 +3172,124 @@ Old-style citations still appear at https://arxiv.org/pdf/hep-th/9901001.
             msg.contains("oops"),
             "error should include body snippet: {msg}"
         );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_systemic_batch_failure_skips_per_id_fallback() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+
+        // Server: always responds 429, counting requests.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_count.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await.ok();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 14\r\nConnection: close\r\n\r\nRate exceeded.",
+                    )
+                    .await
+                    .ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+
+        let ids = vec![
+            "2401.11111".to_string(),
+            "2401.22222".to_string(),
+            "2401.33333".to_string(),
+        ];
+        let response = fetcher
+            .lookup(LookupPapersRequest {
+                arxiv_ids: ids,
+                fetch_missing_metadata: Some(true),
+                refresh_metadata: Some(false),
+            })
+            .await?;
+
+        // Rate limiting is not id-specific: exactly ONE request, no per-id
+        // fallback storm (observed live: 16 requests / 205s / worse 429s).
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(response.network_requests, 1);
+        for paper in &response.papers {
+            let error = paper.error.as_deref().expect("every id carries the error");
+            assert!(error.contains("429"), "error should mention 429: {error}");
+        }
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_fetch_metadata_retries_systemic_errors_with_backoff() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+        let arxiv_id = "2401.11111";
+        let feed = atom_feed_for(arxiv_id, "Retried paper");
+
+        // Server: 500 on the first request, valid feed afterwards.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let count = server_count.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await.ok();
+                let response = if count == 0 {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\noops!".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        feed.len(),
+                        feed
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+        fetcher.metadata_retry_waits = vec![Duration::ZERO];
+
+        // Metadata-only fetch drives the queued-download metadata path.
+        let response = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: arxiv_id.to_string(),
+                include_pdf: Some(false),
+                include_source: Some(false),
+                refresh: Some(false),
+            })
+            .await?;
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2, "one retry");
+        assert_eq!(response.title.as_deref(), Some("Retried paper"));
 
         server.abort();
         Ok(())
