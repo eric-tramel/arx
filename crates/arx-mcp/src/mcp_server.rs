@@ -37,7 +37,7 @@ impl ArxMcpServer {
 impl ArxMcpServer {
     #[tool(
         name = "lookup_arxiv_papers",
-        description = "Metadata-first arXiv lookup. Returns local material readiness, cache file paths, and cached metadata/abstract immediately when present, fetching only missing metadata through the arXiv API by default. It never downloads PDF or source material."
+        description = "Metadata-first arXiv lookup. Returns local material readiness, cache file paths, and cached metadata/abstract for every requested id. Papers with cached metadata always return it even if network requests fail. When a metadata fetch fails, the affected paper entry carries a per-id `error` field with HTTP status and a reason snippet; other papers in the batch are unaffected. It never downloads PDF or source material."
     )]
     pub async fn lookup_arxiv_papers(
         &self,
