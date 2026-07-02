@@ -48,7 +48,16 @@ crates/
 
 ## Install
 
-Recommended install from the latest GitHub release:
+Homebrew (macOS and Linux):
+
+```bash
+brew install eric-tramel/tap/arx
+```
+
+This installs `arx`, `arxd`, and `arx-mcp` from
+[eric-tramel/homebrew-tap](https://github.com/eric-tramel/homebrew-tap).
+
+Or install from the latest GitHub release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/arx/main/install.sh | sh
@@ -89,10 +98,18 @@ cargo run -p arx -- fetch 0704.0001
 cargo run -p arx-mcp -- serve
 ```
 
-Development builds run `rustc` through `sccache` via `.cargo/config.toml`, so
-dependency compilation artifacts are reused across worktrees instead of being
-rebuilt per checkout. Install `sccache` once before running Cargo commands
-locally; GitHub Actions installs it for release/test jobs.
+Local development builds can reuse compilation artifacts across worktrees by
+running `rustc` through `sccache`. Configure it per-user rather than in this
+repository, so source builds (including the Homebrew formula) work without
+sccache installed:
+
+```toml
+# ~/.cargo/config.toml
+[build]
+rustc-wrapper = "sccache"
+```
+
+GitHub Actions sets `RUSTC_WRAPPER=sccache` for release/test jobs.
 
 `arx-mcp serve` is the default MCP command, so an MCP client can launch `arx-mcp` with no arguments or with `serve`. `arx-mcp` starts `arxd` when a tool needs daemon work.
 

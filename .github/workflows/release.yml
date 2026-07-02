@@ -128,3 +128,45 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG_NAME" \
             --notes "Prebuilt arx, arxd, and arx-mcp binaries for Linux x86_64, macOS arm64, and Windows x86_64."
+
+  tap-bump:
+    name: Bump Homebrew tap formula
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tap token
+        id: token
+        env:
+          TAP_BUMP_TOKEN: ${{ secrets.TAP_BUMP_TOKEN }}
+        run: |
+          if [ -n "$TAP_BUMP_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "TAP_BUMP_TOKEN secret is not configured; skipping Homebrew tap bump." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Open tap bump pull request
+        if: steps.token.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_BUMP_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          TAP_REPO: eric-tramel/homebrew-tap
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG_NAME}.tar.gz"
+          sha256="$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="bump-arx-${TAG_NAME}"
+          git checkout -b "$branch"
+          sed -i -E "s|^  url \".*\"$|  url \"${url}\"|" Formula/arx.rb
+          sed -i -E "s|^  sha256 \".*\"$|  sha256 \"${sha256}\"|" Formula/arx.rb
+          git commit -am "arx ${TAG_NAME#v}"
+          git push origin "$branch"
+          gh pr create --repo "$TAP_REPO" \
+            --title "arx ${TAG_NAME#v}" \
+            --body "Automated bump for ${GITHUB_REPOSITORY} release ${TAG_NAME}. Once brew test-bot is green, run the brew pr-pull workflow with this PR number to publish bottles." \
+            --head "$branch" --base main
