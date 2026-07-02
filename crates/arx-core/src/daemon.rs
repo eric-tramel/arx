@@ -189,13 +189,32 @@ impl ArxdClient {
 
     fn spawn_daemon(&self) -> Result<()> {
         let executable = arxd_executable()?;
-        Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .arg("serve")
             .arg("--cache-root")
             .arg(&self.cache_root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // arxd must outlive whichever frontend spawned it: MCP hosts kill
+        // their server's whole process group on exit, and an arxd sharing
+        // that group dies mid-download without running its shutdown path.
+        // Detach it into its own process group so group-directed signals
+        // stop at the frontend.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+        command
             .spawn()
             .with_context(|| format!("spawning arxd at {}", executable.display()))?;
         Ok(())
