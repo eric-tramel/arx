@@ -485,7 +485,11 @@ impl ArxivFetcher {
                 "no results in scope \"{scope}\"; try scope \"default\" or \"all\" to widen the search"
             ));
         }
-        None
+        Some(
+            "no results in the default scope, which excludes bibliography content; \
+             use scope \"all\" to also search .bib/.bbl files and citation records"
+                .to_string(),
+        )
     }
 
     async fn fetch_inner(&self, request: FetchPaperRequest) -> Result<FetchPaperResponse> {
@@ -2823,6 +2827,37 @@ mod tests {
         assert!(
             note.contains("fetch_arxiv_paper") || note.contains("metadata"),
             "note should guide the agent: {note}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_empty_default_scope_notes_bibliography_exclusion() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
+        let arxiv_id = "2401.12345";
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        write_json_pretty(
+            &paths.metadata_path,
+            &metadata_fixture(arxiv_id, "Calibration theorem", "About calibration."),
+        )?;
+        fetcher.index_paper_material(arxiv_id)?;
+
+        // Unscoped corpus query with no matches: the note must tell the
+        // agent that bibliography content is excluded by default.
+        let response = fetcher.full_text_search(FullTextSearchRequest {
+            query: "zzznomatch".to_string(),
+            arxiv_id: None,
+            limit: Some(10),
+            scope: None,
+        })?;
+        assert!(response.results.is_empty());
+        let note = response
+            .note
+            .expect("empty default-scope results should carry a note");
+        assert!(
+            note.contains("bibliography"),
+            "note should mention bibliography exclusion: {note}"
         );
         Ok(())
     }
