@@ -9,7 +9,7 @@ use arx_core::{
     },
     paths::{arxd_lock_path, arxd_log_path, xdg_cache_root},
 };
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use fs2::FileExt;
 use std::{
     ffi::OsString,
@@ -40,7 +40,15 @@ const DEFAULT_LOG_BACKUPS: usize = 5;
 #[derive(Debug, Parser)]
 #[command(name = "arxd")]
 #[command(about = "Local arx daemon for queued downloads and metadata indexing")]
+#[command(version, disable_version_flag = true)]
 struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    _version: bool,
     #[command(subcommand)]
     command: Command,
 }
