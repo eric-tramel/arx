@@ -399,6 +399,152 @@ fn fetch_without_detach_accepts_multiple_arxiv_ids_and_prints_summaries()
 }
 
 #[test]
+fn search_human_rendering_groups_results_into_metadata_panels() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let cache_root = temp.path().join("arx");
+
+    let mut primary_metadata = metadata_json(
+        "2407.00001",
+        "Neural Calibration Maps for Search Panels",
+        &["Ada Analyst", "Bert Builder"],
+        &["cs.IR"],
+    );
+    primary_metadata["summary"] =
+        json!("Synthetic abstract text that should not be confused with a title-only hit.");
+    write_cached_metadata(&cache_root, "2407.00001", primary_metadata)?;
+    write_cached_source_material_with_text(
+        &cache_root,
+        "2407.00001",
+        r#"\section{Evidence}
+The \emph{calibration} body evidence is the primary corroborating paragraph.
+
+A second calibration paragraph explains scoring evidence for the renderer.
+
+A third calibration paragraph keeps the snippet cap visible.
+
+A fourth calibration paragraph must be indexed but not labeled in the panel.
+"#,
+    )?;
+
+    let mut secondary_metadata = metadata_json(
+        "2407.00002",
+        "Calibration Robustness in Retrieval",
+        &["Grace Reviewer"],
+        &["cs.DL"],
+    );
+    secondary_metadata["summary"] =
+        json!("Synthetic abstract text for the second offline search fixture.");
+    write_cached_metadata(&cache_root, "2407.00002", secondary_metadata)?;
+    write_cached_source_material_with_text(
+        &cache_root,
+        "2407.00002",
+        "A separate calibration body paragraph makes a second paper panel observable.\n",
+    )?;
+
+    let output = arx_command(temp.path())
+        .env("COLUMNS", "88")
+        .args(["search", "calibration", "--limit", "12"])
+        .output()?;
+
+    assert_success(&output);
+    assert!(
+        serde_json::from_slice::<Value>(&output.stdout).is_err(),
+        "human search stdout should render panels, not JSON"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("top-rated papers for"),
+        "stdout should summarize paper-ranked search results: {stdout}"
+    );
+    assert!(
+        stdout.contains("showing at most 3 corroborating snippets per paper"),
+        "stdout should disclose the per-paper snippet cap: {stdout}"
+    );
+    assert!(
+        stdout.matches('╭').count() >= 2,
+        "stdout should render one panel per matched paper: {stdout}"
+    );
+    assert!(
+        stdout.contains("Neural Calibration Maps for Search Panels"),
+        "stdout should show metadata title: {stdout}"
+    );
+    assert!(
+        stdout.contains("2024 · Ada Analyst et al. · 2407.00001"),
+        "stdout should show year, first-author-et-al, and arXiv id: {stdout}"
+    );
+    assert!(
+        stdout.contains("2024 · Grace Reviewer · 2407.00002"),
+        "stdout should show single-author metadata without et al.: {stdout}"
+    );
+    assert!(
+        stdout.contains("\x1b[3mNeural Calibration Maps for Search Panels"),
+        "title should be styled with ANSI italics: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("\x1b[1;4;33mcalibration\x1b[0m"),
+        "query term should be highlighted in snippets: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("\x1b[36m\\emph\x1b[0m"),
+        "LaTeX commands in snippets should be ANSI-styled: {stdout:?}"
+    );
+
+    let primary_panel = stdout
+        .split('╭')
+        .find(|panel| panel.contains("Neural Calibration Maps for Search Panels"))
+        .ok_or("primary search panel should be present")?;
+    assert!(
+        primary_panel.contains("3 snippets shown"),
+        "primary panel should report the capped snippet count: {primary_panel}"
+    );
+    assert_eq!(
+        primary_panel.matches(". body ·").count(),
+        3,
+        "primary panel should label no more than three body snippets: {primary_panel}"
+    );
+    assert!(
+        !primary_panel.contains(". title · score"),
+        "title hits should not be repeated as corroborating snippets when body hits exist: {primary_panel}"
+    );
+    assert!(
+        primary_panel.contains("source/extracted/main.tex:"),
+        "source locations should be compacted inside paper panels: {primary_panel}"
+    );
+    assert!(
+        !primary_panel.contains(&cache_root.display().to_string()),
+        "source locations should not expose the temp cache root: {primary_panel}"
+    );
+
+    let json_output = arx_command(temp.path())
+        .args(["--json", "search", "calibration", "--limit", "12"])
+        .output()?;
+    assert_success(&json_output);
+    let search_response: Value = serde_json::from_slice(&json_output.stdout)?;
+    let results = search_response["results"]
+        .as_array()
+        .ok_or("JSON search response should expose the original results array")?;
+    assert!(
+        !results.is_empty(),
+        "JSON search response should contain ranked chunk results: {search_response}"
+    );
+    assert!(
+        search_response.get("papers").is_none(),
+        "JSON search should not switch to human paper-panel metadata: {search_response}"
+    );
+    assert!(
+        search_response.get("metadata_by_id").is_none(),
+        "JSON search should not expose human-rendering metadata lookup state: {search_response}"
+    );
+    assert!(
+        results[0].get("title").is_none()
+            && results[0].get("authors").is_none()
+            && results[0].get("year").is_none(),
+        "JSON chunk results should not gain panel-only metadata fields: {search_response}"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_fetch_commands_share_one_arxd_queue_and_allows_cached_jobs_to_overlap()
 -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
@@ -719,6 +865,39 @@ fn write_cached_source_material(cache_root: &Path, safe_id: &str) -> Result<(), 
         &source_file,
         "A cached source line cites arXiv:2101.00001 for offline lookup.\n",
     )?;
+    let archive_path = source_dir.join("e-print.tar");
+    fs::write(&archive_path, b"local deterministic source archive fixture")?;
+    fs::write(
+        source_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "source_archive_path": archive_path.display().to_string(),
+            "source_extracted_dir": extracted_dir.display().to_string(),
+        }))?,
+    )?;
+    fs::write(
+        paper_dir.join("citations.jsonl"),
+        serde_json::to_string(&json!({
+            "citing_arxiv_id": safe_id.replace('_', "/"),
+            "cited_arxiv_id": "2101.00001",
+            "source_file": source_file.display().to_string(),
+            "line": 1,
+            "context": "A cached source line cites arXiv:2101.00001 for offline lookup."
+        }))? + "\n",
+    )?;
+    Ok(())
+}
+
+fn write_cached_source_material_with_text(
+    cache_root: &Path,
+    safe_id: &str,
+    source_text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let paper_dir = cache_root.join("papers").join(safe_id);
+    let source_dir = paper_dir.join("source");
+    let extracted_dir = source_dir.join("extracted");
+    fs::create_dir_all(&extracted_dir)?;
+    let source_file = extracted_dir.join("main.tex");
+    fs::write(&source_file, source_text)?;
     let archive_path = source_dir.join("e-print.tar");
     fs::write(&archive_path, b"local deterministic source archive fixture")?;
     fs::write(
