@@ -2,10 +2,10 @@ use anyhow::{Context, Result, bail};
 use arx_core::{
     arxiv::{ArxivFetcher, FetchPaperRequest, FetchPaperResponse, normalize_arxiv_id},
     daemon::{
-        ArxdEndpoint, ArxdRequest, ArxdResponse, DownloadJobState, DownloadJobStatus,
-        DownloadQueueStatusRequest, DownloadQueueStatusResponse, MAX_PERSISTED_FINISHED_JOBS,
-        QueuedFetchResponse, read_finished_jobs, remove_endpoint, unix_ms, write_endpoint,
-        write_finished_jobs,
+        ArxdEndpoint, ArxdRequest, ArxdResponse, ArxivServiceHealth, DownloadJobState,
+        DownloadJobStatus, DownloadQueueStatusRequest, DownloadQueueStatusResponse,
+        MAX_PERSISTED_FINISHED_JOBS, QueuedFetchResponse, read_finished_jobs, remove_endpoint,
+        unix_ms, write_endpoint, write_finished_jobs,
     },
     paths::{arxd_lock_path, arxd_log_path, xdg_cache_root},
 };
@@ -29,6 +29,7 @@ use tokio::{
     sync::{Mutex, Semaphore},
     time::{sleep, timeout},
 };
+use tracing::Instrument;
 use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
 
 const DOWNLOAD_WORKERS: usize = 4;
@@ -387,6 +388,19 @@ impl DownloadQueue {
             .into_iter()
             .next()
             .with_context(|| format!("queued job {job_id} disappeared"))?;
+        let mut message = format!(
+            "queued arXiv download; call {STATUS_TOOL_NAME} with this job_id to check progress"
+        );
+        // Tell the enqueuing agent up front when arXiv metadata is degraded
+        // so a metadata-less completion doesn't read as a failure.
+        if let Some(health) = arxiv_service_health(&self.fetcher) {
+            if health.metadata_paused {
+                message.push_str(&format!(
+                    "; note: arXiv metadata is degraded (paused until unix_ms {}); downloads proceed and metadata backfills automatically",
+                    health.metadata_paused_until_unix_ms.unwrap_or_default()
+                ));
+            }
+        }
         Ok(QueuedFetchResponse {
             job_id,
             arxiv_id,
@@ -394,9 +408,7 @@ impl DownloadQueue {
             queue_position: job.queue_position.unwrap_or(0),
             queued_at_unix_ms,
             status_tool: STATUS_TOOL_NAME.to_string(),
-            message: format!(
-                "queued arXiv download; call {STATUS_TOOL_NAME} with this job_id to check progress"
-            ),
+            message,
         })
     }
 
@@ -481,6 +493,7 @@ impl DownloadQueue {
             in_progress_count,
             completed_count,
             failed_count,
+            arxiv_health: arxiv_service_health(&self.fetcher),
             jobs,
         }
     }
@@ -547,6 +560,12 @@ impl DownloadQueue {
             // parent process group (observed live: a codex exit took down
             // arx-mcp and arxd, erasing 10 finished jobs).
             finish_queue.persist_finished().await;
+            // Once the queue drains, backfill metadata for papers that were
+            // downloaded during an arXiv metadata outage. Breaker-guarded:
+            // a no-op while arXiv is still degraded or nothing is pending.
+            if !finish_queue.has_work().await {
+                finish_queue.fetcher.ensure_metadata_cached(&[]).await;
+            }
         });
     }
 
@@ -556,6 +575,18 @@ impl DownloadQueue {
             tracing::warn!(?error, "failed to persist finished jobs");
         }
     }
+}
+
+/// Snapshot of shared arXiv service health for queue status responses;
+/// None only when the shared state file is unreadable.
+fn arxiv_service_health(fetcher: &ArxivFetcher) -> Option<ArxivServiceHealth> {
+    let health = fetcher.metadata_health().ok()?;
+    let paused_until = health.paused_until(unix_ms());
+    Some(ArxivServiceHealth {
+        metadata_paused: paused_until.is_some(),
+        metadata_paused_until_unix_ms: paused_until,
+        metadata_failure_streak: health.failure_streak,
+    })
 }
 
 /// Continue job numbering after persisted history: a fresh arxd that
@@ -588,13 +619,46 @@ async fn run_fetch_job(
         }
     };
 
-    let request = start_job(&state, &job_id).await?;
+    let (request, arxiv_id) = start_job(&state, &job_id).await?;
     if let Some(delay) = worker_hold_duration() {
         sleep(delay).await;
     }
-    let result = fetcher.fetch(request).await.map_err(format_error_chain);
+    // Correlate every log line (metadata retries, rate-limit waits,
+    // download attempts) with the job and paper that caused it.
+    let job_span = tracing::info_span!("download_job", job_id = %job_id, arxiv_id = %arxiv_id);
+    // Coalesce metadata for the whole queue into one batched request
+    // instead of one (retried) Atom query per job, and opportunistically
+    // backfill papers whose metadata is still missing from an earlier
+    // arXiv outage. Best-effort: jobs proceed without metadata.
+    let prefetch_ids = live_job_arxiv_ids(&state).await;
+    fetcher
+        .ensure_metadata_cached(&prefetch_ids)
+        .instrument(job_span.clone())
+        .await;
+    let result = fetcher
+        .fetch(request)
+        .instrument(job_span)
+        .await
+        .map_err(format_error_chain);
     drop(permit);
     Some(result)
+}
+
+/// arXiv ids of every job that has not finished yet. Used to size the
+/// batched metadata prefetch; already-cached ids are filtered downstream.
+async fn live_job_arxiv_ids(state: &Arc<Mutex<QueueState>>) -> Vec<String> {
+    let state = state.lock().await;
+    state
+        .jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                DownloadJobState::Queued | DownloadJobState::InProgress
+            )
+        })
+        .map(|job| job.arxiv_id.clone())
+        .collect()
 }
 
 async fn finish_worker_task(
@@ -660,12 +724,15 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn start_job(state: &Arc<Mutex<QueueState>>, job_id: &str) -> Option<FetchPaperRequest> {
+async fn start_job(
+    state: &Arc<Mutex<QueueState>>,
+    job_id: &str,
+) -> Option<(FetchPaperRequest, String)> {
     let mut state = state.lock().await;
     let job = state.jobs.iter_mut().find(|job| job.job_id == job_id)?;
     job.status = DownloadJobState::InProgress;
     job.started_at_unix_ms = Some(unix_ms());
-    Some(job.request.clone())
+    Some((job.request.clone(), job.arxiv_id.clone()))
 }
 
 async fn finish_job(
@@ -785,7 +852,6 @@ fn worker_hold_duration() -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
 
@@ -1131,6 +1197,53 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let loaded = read_finished_jobs(temp.path());
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_status_surfaces_metadata_pause_from_shared_state() {
+        use arx_core::rate_limit::RateLimiter;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().to_path_buf();
+        let fetcher = Arc::new(ArxivFetcher::new(cache_root.clone()).unwrap());
+        let queue = DownloadQueue::new(fetcher, Vec::new());
+
+        // Healthy state: health present, not paused.
+        let status = queue.status(DownloadQueueStatusRequest::default()).await;
+        let health = status.arxiv_health.expect("health should be reported");
+        assert!(!health.metadata_paused);
+        assert_eq!(health.metadata_failure_streak, 0);
+
+        // Another arx process records repeated metadata failures in the
+        // shared state file; arxd's status must surface the pause.
+        let limiter = RateLimiter::new(&cache_root);
+        limiter.record_metadata_failure().await.unwrap();
+        limiter.record_metadata_failure().await.unwrap();
+
+        let status = queue.status(DownloadQueueStatusRequest::default()).await;
+        let health = status.arxiv_health.expect("health should be reported");
+        assert!(health.metadata_paused);
+        assert_eq!(health.metadata_failure_streak, 2);
+        let paused_until = health
+            .metadata_paused_until_unix_ms
+            .expect("paused_until should be set while paused");
+        assert!(paused_until > status.now_unix_ms);
+    }
+
+    #[test]
+    fn queue_status_response_without_arxiv_health_still_parses() {
+        // Wire compatibility with responses from older arxd builds.
+        let old_json = r#"{
+            "now_unix_ms": 1,
+            "max_active_workers": 4,
+            "queued_count": 0,
+            "in_progress_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "jobs": []
+        }"#;
+        let response: DownloadQueueStatusResponse = serde_json::from_str(old_json).unwrap();
+        assert!(response.arxiv_health.is_none());
     }
 
     #[test]

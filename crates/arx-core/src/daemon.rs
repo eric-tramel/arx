@@ -96,7 +96,29 @@ pub struct DownloadQueueStatusResponse {
     pub in_progress_count: usize,
     pub completed_count: usize,
     pub failed_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Shared arXiv service health. Present whenever arxd can read the shared state; explains download behavior during arXiv outages."
+    )]
+    pub arxiv_health: Option<ArxivServiceHealth>,
     pub jobs: Vec<DownloadJobStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ArxivServiceHealth {
+    #[schemars(
+        description = "True while arXiv metadata requests are paused after repeated systemic failures (timeouts, 429s, 5xx). Material downloads continue during a pause and queued jobs still complete; missing metadata backfills automatically once arXiv recovers."
+    )]
+    pub metadata_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "When the metadata pause lifts and the next probe is allowed, in unix epoch milliseconds."
+    )]
+    pub metadata_paused_until_unix_ms: Option<u64>,
+    #[schemars(
+        description = "Consecutive systemic arXiv metadata failures observed across all arx processes; resets to 0 on the first successful metadata response."
+    )]
+    pub metadata_failure_streak: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

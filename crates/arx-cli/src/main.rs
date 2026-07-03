@@ -429,6 +429,12 @@ fn print_queued_fetch(response: &QueuedFetchResponse) {
 
 fn print_fetch_summary(response: &FetchPaperResponse) {
     println!("{} {}", green("fetched"), response.arxiv_id);
+    if response.metadata_pending {
+        println!(
+            "{} arXiv metadata was unavailable; material downloaded anyway and metadata will backfill on the next lookup or fetch",
+            yellow("note:")
+        );
+    }
     print_field("cache", Some(response.cache_dir.as_str()));
     print_field("metadata", Some(response.metadata_path.as_str()));
     print_field("database", Some(response.metadata_db_path.as_str()));
@@ -905,6 +911,21 @@ fn print_queue_status(status: &DownloadQueueStatusResponse) {
         status.completed_count,
         status.failed_count
     );
+    if let Some(health) = &status.arxiv_health {
+        if health.metadata_paused {
+            let remaining_seconds = health
+                .metadata_paused_until_unix_ms
+                .unwrap_or_default()
+                .saturating_sub(status.now_unix_ms)
+                / 1_000;
+            println!(
+                "{} arXiv metadata degraded ({} consecutive failures); paused {}s more — downloads continue, metadata backfills automatically",
+                yellow("warning:"),
+                health.metadata_failure_streak,
+                remaining_seconds
+            );
+        }
+    }
     if status.jobs.is_empty() {
         println!("{} no matching jobs", green("idle"));
         return;
