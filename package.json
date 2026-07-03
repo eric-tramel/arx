@@ -1,0 +1,31 @@
+{
+  "name": "@arx/agent-plugin",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Agent skills and MCP configuration for using arx with locally cached arXiv papers.",
+  "license": "MIT",
+  "homepage": "https://github.com/eric-tramel/arx",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eric-tramel/arx"
+  },
+  "keywords": [
+    "arx",
+    "arxiv",
+    "mcp",
+    "papers",
+    "research",
+    "agent-skills"
+  ],
+  "omp": {
+    "name": "arx",
+    "description": "Use arx MCP and bundled skills from Oh My Pi."
+  },
+  "pi": {
+    "name": "arx",
+    "description": "Use arx MCP and bundled skills from Pi.",
+    "skills": [
+      "plugins/arx/skills"
+    ]
+  }
+}
