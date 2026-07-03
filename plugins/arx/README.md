@@ -4,11 +4,10 @@ This plugin vendors Agent Skills and MCP configuration for using `arx` from Code
 
 ## Requirements
 
-- Unix, macOS, or Linux for plugin-managed MCP launch.
-- `arx-mcp` and `arxd` installed on `PATH` from the same install directory.
-- Installed binaries must be outside the current project directory and outside Git worktrees. This prevents a harness from accidentally running a local checkout binary.
+- `arx-mcp` installed on the agent harness `PATH`.
+- `arxd` installed where `arx-mcp` can find it: `ARXD_BIN`, a sibling `arxd` next to `arx-mcp`, or `arxd` on `PATH`.
 
-Windows users can still configure MCP manually with `arx-mcp print-config`.
+If a harness cannot inherit your shell `PATH`, configure MCP manually with the absolute-path snippet from `arx-mcp print-config`.
 
 This plugin does not install `arx`; install the binaries first with Homebrew, a release installer, or `cargo install`.
 
@@ -20,7 +19,7 @@ This plugin does not install `arx`; install the binaries first with Homebrew, a 
 
 ## MCP
 
-The plugin configures one MCP server named `arx`. The launcher resolves both `arx-mcp` and `arxd`, requires them to come from the same install directory, exports `ARXD_BIN`, then runs:
+The plugin configures one MCP server named `arx` and launches:
 
 ```sh
 arx-mcp serve
