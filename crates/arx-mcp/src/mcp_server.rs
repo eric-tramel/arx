@@ -66,7 +66,7 @@ impl ArxMcpServer {
 
     #[tool(
         name = "fetch_arxiv_paper",
-        description = "Queue an arXiv paper download (metadata, PDF, and/or TeX source) through arxd and return immediately with a download job id. Fetched material is cached locally and indexed for full_text_search automatically. Use only when lookup_arxiv_papers shows needed material is missing."
+        description = "Queue an arXiv paper download (metadata, PDF, and/or TeX source) through arxd and return immediately with a download job id. Fetched material is cached locally and indexed for full_text_search automatically. Downloads are resilient to arXiv metadata outages: PDFs/source still download and the job completes with metadata_pending=true; missing metadata backfills automatically once arXiv recovers. Use only when lookup_arxiv_papers shows needed material is missing."
     )]
     pub async fn fetch_arxiv_paper(
         &self,
@@ -81,7 +81,7 @@ impl ArxMcpServer {
 
     #[tool(
         name = "get_arxiv_download_queue_status",
-        description = "Ask arxd for queued, in-progress, completed, and failed arXiv download jobs. Finished job records (completed/failed) are durable across arxd restarts — pass include_finished:true to see them. Pass a job_id to inspect one download."
+        description = "Ask arxd for queued, in-progress, completed, and failed arXiv download jobs. Finished job records (completed/failed) are durable across arxd restarts — pass include_finished:true to see them. Pass a job_id to inspect one download. The response's arxiv_health field reports arXiv service degradation: when metadata_paused is true, arXiv's metadata API is rate-limited/down until metadata_paused_until_unix_ms, but material downloads still proceed and metadata backfills automatically — do not retry fetches to force metadata."
     )]
     pub async fn get_arxiv_download_queue_status(
         &self,

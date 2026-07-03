@@ -2,7 +2,7 @@ use crate::{
     material_index::{CorpusSearchResult, MaterialChunk, MaterialIndex, category},
     metadata_db::{IndexReport, MetadataDatabase},
     paths,
-    rate_limit::RateLimiter,
+    rate_limit::{MetadataHealth, RateLimiter},
 };
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -10,16 +10,17 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
     time::Duration,
 };
 use walkdir::WalkDir;
 const DOWNLOAD_MAX_ATTEMPTS: usize = 3;
 const METADATA_URL: &str = "https://export.arxiv.org/api/query";
+const MATERIAL_BASE_URL: &str = "https://arxiv.org";
 /// Fail-fast bound on metadata requests. Applied per-request (not on the shared
 /// client) because PDF and source downloads legitimately take longer.
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +30,15 @@ const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 /// How long every arx process backs off after arXiv answers 429.
 const RATE_LIMIT_PENALTY: Duration = Duration::from_secs(30);
+/// Bound on establishing any arXiv connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on silence between read chunks on any arXiv response. Unlike a
+/// total-request timeout this never fails a large-but-progressing PDF or
+/// source download, but a stalled connection can no longer hold the shared
+/// rate-limit lock (and with it the whole download queue) forever.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Most arXiv ids sent in one batched metadata query.
+const METADATA_BATCH_LIMIT: usize = 50;
 
 static ARXIV_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?$")
@@ -56,9 +66,38 @@ pub struct ArxivFetcher {
     rate_limiter: RateLimiter,
     metadata_db: MetadataDatabase,
     metadata_url: String,
+    material_base_url: String,
     metadata_timeout: Duration,
     metadata_retry_waits: Vec<Duration>,
+    /// Single-flight guard so concurrent download workers coalesce into one
+    /// batched metadata request instead of issuing one request per job.
+    metadata_prefetch_lock: Arc<tokio::sync::Mutex<()>>,
+    /// arXiv ids whose material was fetched while the metadata API was
+    /// unavailable; `ensure_metadata_cached` backfills these opportunistically.
+    pending_metadata: Arc<StdMutex<BTreeSet<String>>>,
 }
+
+/// Typed error raised while the shared circuit breaker has arXiv metadata
+/// requests paused after repeated systemic failures. Material (PDF/source)
+/// downloads are NOT affected: they use a different arXiv host and queued
+/// jobs proceed without metadata, which backfills automatically later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataPausedError {
+    pub paused_until_unix_ms: u64,
+}
+
+impl std::fmt::Display for MetadataPausedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "arXiv metadata requests are paused until unix_ms {} after repeated arXiv metadata failures; \
+             material downloads continue and metadata backfills automatically once arXiv recovers",
+            self.paused_until_unix_ms
+        )
+    }
+}
+
+impl std::error::Error for MetadataPausedError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FetchPaperRequest {
@@ -102,6 +141,11 @@ pub struct FetchPaperResponse {
     pub cache_hit: bool,
     pub network_requests: usize,
     pub rate_limit_delay_seconds: u64,
+    #[serde(default)]
+    #[schemars(
+        description = "True when material was fetched while arXiv's metadata API was unavailable. The download itself succeeded; metadata backfills automatically on a later fetch or lookup once arXiv recovers."
+    )]
+    pub metadata_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -321,6 +365,11 @@ impl ArxivFetcher {
         let client = reqwest::Client::builder()
             .user_agent(user_agent)
             .redirect(reqwest::redirect::Policy::limited(10))
+            // A request with no bound can hold the shared rate-limit lock
+            // forever and freeze every arx process; stall-based bounds fail
+            // hung connections without capping large slow downloads.
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_STALL_TIMEOUT)
             .build()
             .context("building HTTP client")?;
         let metadata_db = MetadataDatabase::new(&cache_root);
@@ -330,8 +379,11 @@ impl ArxivFetcher {
             cache_root,
             client,
             metadata_url: METADATA_URL.to_string(),
+            material_base_url: MATERIAL_BASE_URL.to_string(),
             metadata_timeout: METADATA_REQUEST_TIMEOUT,
             metadata_retry_waits: METADATA_RETRY_WAITS.to_vec(),
+            metadata_prefetch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_metadata: Arc::new(StdMutex::new(BTreeSet::new())),
         })
     }
 
@@ -513,25 +565,55 @@ impl ArxivFetcher {
         }
 
         let mut network_requests = 0;
-        let metadata = if options.refresh || !paths.metadata_path.exists() {
-            network_requests += 1;
-            let metadata = self.fetch_metadata(&arxiv_id).await?;
-            write_json_pretty(&paths.metadata_path, &metadata)?;
-            metadata
+        let mut metadata_pending = false;
+        let metadata: Option<PaperMetadata> = if !options.refresh && paths.metadata_path.exists() {
+            Some(read_json(&paths.metadata_path)?)
         } else {
-            read_json(&paths.metadata_path)?
+            network_requests += 1;
+            match self.fetch_metadata(&arxiv_id).await {
+                Ok(metadata) => {
+                    write_json_pretty(&paths.metadata_path, &metadata)?;
+                    self.clear_pending_metadata(&arxiv_id);
+                    Some(metadata)
+                }
+                // Metadata lives on export.arxiv.org; PDFs and source live on
+                // arxiv.org. A metadata outage must not block material
+                // downloads — proceed without it and backfill later.
+                Err(error) if is_recoverable_metadata_outage(&error) => {
+                    if paths.metadata_path.exists() {
+                        tracing::warn!(
+                            arxiv_id = %arxiv_id,
+                            error = %format!("{error:#}"),
+                            "metadata refresh failed; keeping the cached copy"
+                        );
+                        Some(read_json(&paths.metadata_path)?)
+                    } else {
+                        tracing::warn!(
+                            arxiv_id = %arxiv_id,
+                            error = %format!("{error:#}"),
+                            "arXiv metadata unavailable; downloading material without it and backfilling later"
+                        );
+                        metadata_pending = true;
+                        self.mark_pending_metadata(&arxiv_id);
+                        None
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         };
-        self.metadata_db.upsert_paper(&self.cache_root, &metadata)?;
+        if let Some(metadata) = &metadata {
+            self.metadata_db.upsert_paper(&self.cache_root, metadata)?;
+        }
 
         if options.include_pdf && (options.refresh || !paths.pdf_path.exists()) {
             network_requests += 1;
-            let pdf = self.download_bytes(pdf_url(&arxiv_id)).await?;
+            let pdf = self.download_bytes(self.pdf_url(&arxiv_id)).await?;
             write_bytes_atomic(&paths.pdf_path, &pdf)?;
         }
 
         if options.include_source && (options.refresh || !paths.source_manifest_path.exists()) {
             network_requests += 1;
-            let bytes = self.download_bytes(source_url(&arxiv_id)).await?;
+            let bytes = self.download_bytes(self.source_url(&arxiv_id)).await?;
             let manifest = materialize_source(&paths, &bytes)?;
             let citation_count = extract_citations(&arxiv_id, &paths, &manifest)?;
             write_json_pretty(&paths.source_manifest_path, &manifest)?;
@@ -545,12 +627,17 @@ impl ArxivFetcher {
                 source_archive_path: Some(manifest.source_archive_path),
                 source_extracted_dir: manifest.source_extracted_dir,
                 citations_jsonl_path: Some(display_path(&paths.citations_path)),
-                title: metadata.title,
-                authors: metadata.authors,
+                title: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.title.clone()),
+                authors: metadata
+                    .map(|metadata| metadata.authors)
+                    .unwrap_or_default(),
                 citation_count,
                 cache_hit: false,
                 network_requests,
                 rate_limit_delay_seconds: crate::rate_limit::ARXIV_DELAY.as_secs(),
+                metadata_pending,
             });
         }
 
@@ -567,12 +654,17 @@ impl ArxivFetcher {
                     source_archive_path: Some(manifest.source_archive_path),
                     source_extracted_dir: manifest.source_extracted_dir,
                     citations_jsonl_path: Some(display_path(&paths.citations_path)),
-                    title: metadata.title,
-                    authors: metadata.authors,
+                    title: metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.title.clone()),
+                    authors: metadata
+                        .map(|metadata| metadata.authors)
+                        .unwrap_or_default(),
                     citation_count,
                     cache_hit: false,
                     network_requests,
                     rate_limit_delay_seconds: crate::rate_limit::ARXIV_DELAY.as_secs(),
+                    metadata_pending,
                 });
             }
         }
@@ -593,12 +685,17 @@ impl ArxivFetcher {
             citations_jsonl_path: options
                 .include_source
                 .then(|| display_path(&paths.citations_path)),
-            title: metadata.title,
-            authors: metadata.authors,
+            title: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone()),
+            authors: metadata
+                .map(|metadata| metadata.authors)
+                .unwrap_or_default(),
             citation_count,
             cache_hit: false,
             network_requests,
             rate_limit_delay_seconds: crate::rate_limit::ARXIV_DELAY.as_secs(),
+            metadata_pending,
         })
     }
 
@@ -908,6 +1005,7 @@ impl ArxivFetcher {
             cache_hit: true,
             network_requests: 0,
             rate_limit_delay_seconds: crate::rate_limit::ARXIV_DELAY.as_secs(),
+            metadata_pending: false,
         })
     }
 
@@ -916,6 +1014,9 @@ impl ArxivFetcher {
     /// arXiv slowness or rate limiting retries with backoff instead of
     /// failing the job on the first 10s timeout (observed live: 14 queued
     /// jobs failed on single timeouts and the agent bypassed arx entirely).
+    /// When the shared circuit breaker pauses metadata (repeated systemic
+    /// failures across all workers), this returns the pause error
+    /// immediately instead of sleeping through doomed retries.
     async fn fetch_metadata(&self, arxiv_id: &str) -> Result<PaperMetadata> {
         let requested = arxiv_id.to_string();
         let mut last_error = None;
@@ -942,16 +1043,25 @@ impl ArxivFetcher {
                         });
                 }
                 Err(error) => {
+                    if error.downcast_ref::<MetadataPausedError>().is_some() {
+                        return Err(error);
+                    }
                     let error_text = format!("{error:#}");
                     if !is_systemic_metadata_error(&error_text) {
                         return Err(error);
                     }
                     tracing::info!(
+                        arxiv_id = %requested,
                         attempt = attempt + 1,
                         error = %error_text,
                         "metadata fetch failed for queued download; will retry if attempts remain"
                     );
                     last_error = Some(error);
+                    // This failure may have tripped the shared breaker; stop
+                    // retrying right away instead of sleeping into a pause.
+                    if let Err(paused) = self.check_metadata_pause() {
+                        return Err(paused);
+                    }
                     if let Some(wait) = wait {
                         tokio::time::sleep(wait).await;
                     }
@@ -961,67 +1071,208 @@ impl ArxivFetcher {
         Err(last_error.expect("at least one metadata fetch attempt"))
     }
 
+    /// Fail fast with `MetadataPausedError` while the shared metadata
+    /// circuit breaker is open.
+    fn check_metadata_pause(&self) -> Result<()> {
+        let health = self.rate_limiter.metadata_health()?;
+        let now = crate::rate_limit::now_unix_ms()?;
+        if let Some(paused_until_unix_ms) = health.paused_until(now) {
+            return Err(anyhow::Error::new(MetadataPausedError {
+                paused_until_unix_ms,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Shared arXiv metadata service health (failure streak and pause), as
+    /// recorded in the cross-process rate-limit state.
+    pub fn metadata_health(&self) -> Result<MetadataHealth> {
+        self.rate_limiter.metadata_health()
+    }
+
+    fn mark_pending_metadata(&self, arxiv_id: &str) {
+        if let Ok(mut pending) = self.pending_metadata.lock() {
+            pending.insert(arxiv_id.to_string());
+        }
+    }
+
+    fn clear_pending_metadata(&self, arxiv_id: &str) {
+        if let Ok(mut pending) = self.pending_metadata.lock() {
+            pending.remove(arxiv_id);
+        }
+    }
+
+    /// Best-effort batched metadata prefetch and backfill. One Atom request
+    /// covers every given id that is missing metadata.json, plus any papers
+    /// whose material was previously fetched during a metadata outage.
+    /// Single-flighted: concurrent download workers coalesce into one
+    /// request instead of issuing one (retried) request per queued job.
+    /// Never fails the caller — jobs proceed without metadata and the
+    /// breaker throttles attempts while arXiv is degraded.
+    pub async fn ensure_metadata_cached(&self, arxiv_ids: &[String]) {
+        let prefetch_lock = self.metadata_prefetch_lock.clone();
+        let _flight = prefetch_lock.lock().await;
+
+        let mut missing = Vec::new();
+        let mut seen = BTreeSet::new();
+        let backfill_ids: Vec<String> = self
+            .pending_metadata
+            .lock()
+            .map(|pending| pending.iter().cloned().collect())
+            .unwrap_or_default();
+        for id in arxiv_ids.iter().chain(backfill_ids.iter()) {
+            let Ok(arxiv_id) = normalize_arxiv_id(id) else {
+                continue;
+            };
+            if !seen.insert(arxiv_id.clone()) {
+                continue;
+            }
+            if PaperPaths::new(&self.cache_root, &arxiv_id)
+                .metadata_path
+                .exists()
+            {
+                // Already cached (possibly by a concurrent worker while we
+                // waited on the single-flight lock); prune stale backfills.
+                self.clear_pending_metadata(&arxiv_id);
+                continue;
+            }
+            missing.push(arxiv_id);
+        }
+        missing.truncate(METADATA_BATCH_LIMIT);
+        if missing.is_empty() {
+            return;
+        }
+
+        match self.fetch_metadata_batch(&missing).await {
+            Ok(fetched) => {
+                let fetched_by_id = metadata_lookup(fetched);
+                let mut cached = 0usize;
+                for arxiv_id in &missing {
+                    let Some(metadata) = fetched_by_id
+                        .get(arxiv_id)
+                        .or_else(|| fetched_by_id.get(&base_arxiv_id(arxiv_id)))
+                    else {
+                        continue;
+                    };
+                    let paths = PaperPaths::new(&self.cache_root, arxiv_id);
+                    let stored = write_json_pretty(&paths.metadata_path, metadata)
+                        .and_then(|()| self.metadata_db.upsert_paper(&self.cache_root, metadata));
+                    match stored {
+                        Ok(_) => {
+                            self.clear_pending_metadata(arxiv_id);
+                            cached += 1;
+                        }
+                        Err(error) => tracing::warn!(
+                            arxiv_id = %arxiv_id,
+                            error = %format!("{error:#}"),
+                            "failed to store prefetched metadata"
+                        ),
+                    }
+                }
+                tracing::info!(
+                    requested = missing.len(),
+                    cached,
+                    id_list = %missing.join(","),
+                    "batched metadata prefetch for queued downloads"
+                );
+            }
+            Err(error) => {
+                tracing::info!(
+                    id_list = %missing.join(","),
+                    error = %format!("{error:#}"),
+                    "batched metadata prefetch failed; downloads continue without metadata"
+                );
+            }
+        }
+    }
+
     async fn fetch_metadata_batch(&self, arxiv_ids: &[String]) -> Result<Vec<PaperMetadata>> {
         if arxiv_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Fail fast while the shared breaker has metadata paused, before
+        // queueing on the rate-limit lock.
+        self.check_metadata_pause()?;
         let id_list = arxiv_ids.join(",");
         let max_results = arxiv_ids.len().to_string();
         let request_result = self
             .rate_limiter
-            .run(|| async {
-                let response = self
-                    .client
-                    .get(&self.metadata_url)
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                    .query(&[
-                        ("id_list", id_list.as_str()),
-                        ("max_results", max_results.as_str()),
-                    ])
-                    // Fail fast: bound this request only, so slow arXiv error
-                    // responses cannot hang lookup. PDF/source downloads use the
-                    // shared client without this bound.
-                    .timeout(self.metadata_timeout)
-                    .send()
-                    .await
-                    .map_err(|error| self.map_metadata_error(error))?;
-                let status = response.status();
-                if !status.is_success() {
-                    let snippet = response
-                        .text()
+            .run_with_penalty(
+                || async {
+                    // Authoritative re-check under the lock: another worker
+                    // may have tripped the breaker while we waited our turn.
+                    self.check_metadata_pause()?;
+                    let response = self
+                        .client
+                        .get(&self.metadata_url)
+                        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                        .query(&[
+                            ("id_list", id_list.as_str()),
+                            ("max_results", max_results.as_str()),
+                        ])
+                        // Fail fast: bound this request only, so slow arXiv error
+                        // responses cannot hang lookup. PDF/source downloads use the
+                        // shared client without this bound.
+                        .timeout(self.metadata_timeout)
+                        .send()
                         .await
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>();
-                    let snippet = snippet.trim().to_string();
-                    if snippet.is_empty() {
-                        bail!("arXiv metadata request failed: {status}");
-                    } else {
-                        bail!("arXiv metadata request failed: {status}: {snippet}");
+                        .map_err(|error| self.map_metadata_error(error))?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        let snippet = response
+                            .text()
+                            .await
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect::<String>();
+                        let snippet = snippet.trim().to_string();
+                        if snippet.is_empty() {
+                            bail!("arXiv metadata request failed: {status}");
+                        } else {
+                            bail!("arXiv metadata request failed: {status}: {snippet}");
+                        }
                     }
-                }
-                response.text().await.map_err(|error| {
-                    if error.is_timeout() {
-                        self.map_metadata_error(error)
-                    } else {
-                        anyhow::Error::new(error)
-                            .context(format!("reading arXiv metadata response for {id_list}"))
-                    }
-                })
-            })
+                    response.text().await.map_err(|error| {
+                        if error.is_timeout() {
+                            self.map_metadata_error(error)
+                        } else {
+                            anyhow::Error::new(error)
+                                .context(format!("reading arXiv metadata response for {id_list}"))
+                        }
+                    })
+                },
+                // 429 penalties land while the lock is still held, so no
+                // other worker can slip a request in before the backoff.
+                rate_limit_penalty,
+            )
             .await;
-        let text = match request_result {
-            Ok(text) => text,
+        // Track shared metadata health so concurrent jobs stop hammering a
+        // degraded metadata API: systemic failures escalate the shared
+        // pause; any real answer from the service clears it.
+        match &request_result {
+            Ok(_) => self.rate_limiter.record_metadata_recovery().await?,
             Err(error) => {
-                // Penalize outside run(): the rate-limit lock is released
-                // here, and penalize acquires it again.
-                if format!("{error:#}").contains("429") {
-                    self.rate_limiter.penalize(RATE_LIMIT_PENALTY).await?;
+                if error.downcast_ref::<MetadataPausedError>().is_none() {
+                    let error_text = format!("{error:#}");
+                    if is_systemic_metadata_error(&error_text) {
+                        let health = self.rate_limiter.record_metadata_failure().await?;
+                        let now = crate::rate_limit::now_unix_ms()?;
+                        if let Some(paused_until_unix_ms) = health.paused_until(now) {
+                            tracing::warn!(
+                                id_list = %id_list,
+                                failure_streak = health.failure_streak,
+                                paused_until_unix_ms,
+                                "arXiv metadata degraded; pausing metadata requests (material downloads unaffected)"
+                            );
+                        }
+                    } else {
+                        self.rate_limiter.record_metadata_recovery().await?;
+                    }
                 }
-                return Err(error);
             }
-        };
+        }
+        let text = request_result?;
         parse_metadata_feed(arxiv_ids, &text)
     }
 
@@ -1047,9 +1298,6 @@ impl ArxivFetcher {
                 Err(error)
                     if attempt < DOWNLOAD_MAX_ATTEMPTS && should_retry_download_error(&error) =>
                 {
-                    if is_rate_limited_error(&error) {
-                        self.rate_limiter.penalize(RATE_LIMIT_PENALTY).await?;
-                    }
                     tracing::info!(
                         %url,
                         attempt,
@@ -1073,24 +1321,60 @@ impl ArxivFetcher {
 
     async fn download_bytes_once(&self, url: &str) -> Result<Vec<u8>> {
         self.rate_limiter
-            .run(|| async {
-                let response = self
-                    .client
-                    .get(url)
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                    .send()
-                    .await
-                    .with_context(|| format!("requesting {url}"))?
-                    .error_for_status()
-                    .with_context(|| format!("{url} returned an error status"))?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .with_context(|| format!("reading response body from {url}"))?;
-                Ok(bytes.to_vec())
-            })
+            .run_with_penalty(
+                || async {
+                    let response = self
+                        .client
+                        .get(url)
+                        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                        .send()
+                        .await
+                        .with_context(|| format!("requesting {url}"))?
+                        .error_for_status()
+                        .with_context(|| format!("{url} returned an error status"))?;
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .with_context(|| format!("reading response body from {url}"))?;
+                    Ok(bytes.to_vec())
+                },
+                rate_limit_penalty,
+            )
             .await
     }
+
+    fn pdf_url(&self, arxiv_id: &str) -> String {
+        format!("{}/pdf/{arxiv_id}", self.material_base_url)
+    }
+
+    fn source_url(&self, arxiv_id: &str) -> String {
+        format!("{}/e-print/{arxiv_id}", self.material_base_url)
+    }
+}
+
+/// Classify an arXiv request failure for the shared rate-limit penalty that
+/// `RateLimiter::run_with_penalty` applies while the lock is still held.
+/// Detects 429s both as reqwest status errors (material downloads) and in
+/// the error text this module produces for metadata requests.
+fn rate_limit_penalty(error: &anyhow::Error) -> Option<Duration> {
+    // A paused-metadata bail is a local short-circuit, not an arXiv answer;
+    // its text embeds a unix timestamp that could contain "429" by chance.
+    if error.downcast_ref::<MetadataPausedError>().is_some() {
+        return None;
+    }
+    // "429 Too Many Requests" is the exact status text in this module's
+    // metadata bail; a bare "429" would also match arXiv ids and timestamps
+    // embedded in unrelated errors.
+    (is_rate_limited_error(error) || format!("{error:#}").contains("429 Too Many Requests"))
+        .then_some(RATE_LIMIT_PENALTY)
+}
+
+/// True when a metadata failure reflects arXiv-side unavailability rather
+/// than anything wrong with the requested paper, so a queued download should
+/// proceed to material and backfill metadata later instead of failing.
+fn is_recoverable_metadata_outage(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MetadataPausedError>().is_some()
+        || is_systemic_metadata_error(&format!("{error:#}"))
 }
 
 /// True when a metadata failure is not specific to any single arXiv id —
@@ -1105,6 +1389,7 @@ fn is_systemic_metadata_error(error_text: &str) -> bool {
         || error_text.contains("502")
         || error_text.contains("503")
         || error_text.contains("requesting arXiv metadata")
+        || error_text.contains("metadata requests are paused")
 }
 
 fn is_rate_limited_error(error: &anyhow::Error) -> bool {
@@ -1237,14 +1522,6 @@ pub fn arxiv_id_year(input: &str) -> Result<u16> {
             Ok(2000 + short_year)
         }
     }
-}
-
-fn pdf_url(arxiv_id: &str) -> String {
-    format!("https://arxiv.org/pdf/{arxiv_id}")
-}
-
-fn source_url(arxiv_id: &str) -> String {
-    format!("https://arxiv.org/e-print/{arxiv_id}")
 }
 
 fn parse_metadata_feed(requested_ids: &[String], atom: &str) -> Result<Vec<PaperMetadata>> {
@@ -1934,16 +2211,22 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn download_url_helpers_use_arxiv_file_host() {
+    fn download_url_helpers_use_arxiv_file_host() -> Result<()> {
+        let temp = tempdir()?;
+        let fetcher = ArxivFetcher::new(temp.path().to_path_buf())?;
         let arxiv_id = "2401.12345v2";
 
         assert_eq!(
-            source_url(arxiv_id),
+            fetcher.source_url(arxiv_id),
             "https://arxiv.org/e-print/2401.12345v2"
         );
-        assert_eq!(pdf_url(arxiv_id), "https://arxiv.org/pdf/2401.12345v2");
-        assert!(!source_url(arxiv_id).contains("export.arxiv.org"));
-        assert!(!pdf_url(arxiv_id).contains("export.arxiv.org"));
+        assert_eq!(
+            fetcher.pdf_url(arxiv_id),
+            "https://arxiv.org/pdf/2401.12345v2"
+        );
+        assert!(!fetcher.source_url(arxiv_id).contains("export.arxiv.org"));
+        assert!(!fetcher.pdf_url(arxiv_id).contains("export.arxiv.org"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -3452,6 +3735,546 @@ Old-style citations still appear at https://arxiv.org/pdf/hep-th/9901001.
         assert!(fetched_by_id.get(id_bad).is_none());
         assert!(fetched_by_id.get(id_good).is_some());
 
+        Ok(())
+    }
+
+    /// Serve fake PDF bytes and a synthetic source tar for /pdf/... and
+    /// /e-print/... requests, counting requests.
+    fn spawn_material_server(
+        listener: tokio::net::TcpListener,
+        request_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncWriteExt;
+
+        tokio::spawn(async move {
+            let pdf_bytes = b"%PDF-1.4 synthetic".to_vec();
+            let source_bytes = searchable_source_bundle().expect("synthetic source bundle");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let body: &[u8] = if request.starts_with("GET /pdf/") {
+                    &pdf_bytes
+                } else {
+                    &source_bytes
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        })
+    }
+
+    /// Accept metadata connections but never answer, so every request hits
+    /// the client-side timeout — the observed export.arxiv.org failure mode.
+    fn spawn_hanging_metadata_server(
+        listener: tokio::net::TcpListener,
+        request_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        use std::sync::atomic::Ordering;
+
+        tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await.ok();
+                streams.push(stream);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_downloads_material_and_reports_pending_metadata_when_metadata_is_down()
+    -> Result<()> {
+        use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+        use tokio::net::TcpListener;
+
+        let metadata_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let metadata_addr = metadata_listener.local_addr()?;
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
+        let metadata_server =
+            spawn_hanging_metadata_server(metadata_listener, metadata_requests.clone());
+
+        let material_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let material_addr = material_listener.local_addr()?;
+        let material_requests = Arc::new(AtomicUsize::new(0));
+        let material_server = spawn_material_server(material_listener, material_requests.clone());
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{metadata_addr}/api/query");
+        fetcher.material_base_url = format!("http://{material_addr}");
+        fetcher.metadata_timeout = Duration::from_millis(200);
+        fetcher.metadata_retry_waits = vec![Duration::ZERO];
+
+        let arxiv_id = "2401.12345";
+        let response = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: arxiv_id.to_string(),
+                include_pdf: Some(true),
+                include_source: Some(true),
+                refresh: Some(false),
+            })
+            .await?;
+
+        // The job completed: material was downloaded from the healthy host
+        // even though the metadata host never answered.
+        assert!(response.metadata_pending, "metadata must be pending");
+        assert!(response.title.is_none());
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        assert!(paths.pdf_path.exists(), "pdf must be cached");
+        assert!(paths.source_manifest_path.exists(), "source must be cached");
+        assert!(
+            !paths.metadata_path.exists(),
+            "no metadata.json while arXiv metadata is down"
+        );
+        assert!(
+            material_requests.load(Ordering::SeqCst) >= 2,
+            "pdf and source must have been fetched"
+        );
+
+        // Two consecutive systemic failures tripped the shared breaker.
+        // Assert the recorded state, not liveness against the wall clock:
+        // the material download + indexing above can outlast the 30s pause
+        // window when the test host is heavily loaded.
+        let health = fetcher.metadata_health()?;
+        assert_eq!(health.failure_streak, 2);
+        assert!(
+            health.paused_until_unix_ms > 0,
+            "metadata pause deadline should be recorded"
+        );
+
+        metadata_server.abort();
+        material_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_metadata_entirely_while_breaker_is_open() -> Result<()> {
+        use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+        use tokio::net::TcpListener;
+
+        let metadata_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let metadata_addr = metadata_listener.local_addr()?;
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
+        let metadata_server =
+            spawn_hanging_metadata_server(metadata_listener, metadata_requests.clone());
+
+        let material_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let material_addr = material_listener.local_addr()?;
+        let material_requests = Arc::new(AtomicUsize::new(0));
+        let material_server = spawn_material_server(material_listener, material_requests.clone());
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{metadata_addr}/api/query");
+        fetcher.material_base_url = format!("http://{material_addr}");
+
+        // Open the shared breaker the way production does: consecutive
+        // systemic failures recorded by other workers/processes.
+        fetcher.rate_limiter.record_metadata_failure().await?;
+        fetcher.rate_limiter.record_metadata_failure().await?;
+
+        let start = std::time::Instant::now();
+        let response = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: "2401.22222".to_string(),
+                include_pdf: Some(true),
+                include_source: Some(false),
+                refresh: Some(false),
+            })
+            .await?;
+
+        assert!(response.metadata_pending);
+        assert_eq!(
+            metadata_requests.load(Ordering::SeqCst),
+            0,
+            "an open breaker must short-circuit metadata without network attempts"
+        );
+        assert!(material_requests.load(Ordering::SeqCst) >= 1);
+        // Well under the 30s pause: proves the fetch never waited it out.
+        // (Zero metadata requests above is the primary short-circuit proof;
+        // this bound only needs headroom for slow loaded test hosts.)
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "paused metadata must not delay the material download"
+        );
+
+        metadata_server.abort();
+        material_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_metadata_cached_coalesces_ids_into_one_batched_request() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+
+        let feed = format!(
+            r#"<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>https://arxiv.org/abs/2401.11111</id>
+    <title>Paper One</title>
+    <summary>Abstract one.</summary>
+    <author><name>Author A</name></author>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2401.22222</id>
+    <title>Paper Two</title>
+    <summary>Abstract two.</summary>
+    <author><name>Author B</name></author>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2401.33333</id>
+    <title>Paper Three</title>
+    <summary>Abstract three.</summary>
+    <author><name>Author C</name></author>
+  </entry>
+</feed>"#
+        );
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_count.fetch_add(1, Ordering::SeqCst);
+                if let Ok(request) = read_http_request(&mut stream).await {
+                    requests.push(request);
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    feed.len(),
+                    feed
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+
+        let ids = vec![
+            "2401.11111".to_string(),
+            "2401.22222".to_string(),
+            "2401.33333".to_string(),
+        ];
+        fetcher.ensure_metadata_cached(&ids).await;
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "three queued papers must produce exactly one metadata request"
+        );
+        for id in &ids {
+            let paths = PaperPaths::new(temp.path(), id);
+            assert!(
+                paths.metadata_path.exists(),
+                "metadata for {id} should be cached by the batch"
+            );
+        }
+
+        // A second call is a no-op: everything is cached.
+        fetcher.ensure_metadata_cached(&ids).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_metadata_cached_backfills_pending_papers_after_recovery() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+        let arxiv_id = "2401.44444";
+        let feed = atom_feed_for(arxiv_id, "Backfilled paper");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_count.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await.ok();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    feed.len(),
+                    feed
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+
+        // A paper downloaded during an outage left metadata pending.
+        fetcher.mark_pending_metadata(arxiv_id);
+
+        // Queue-drain backfill runs with no explicit ids.
+        fetcher.ensure_metadata_cached(&[]).await;
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        assert!(paths.metadata_path.exists());
+        let metadata: PaperMetadata = read_json(&paths.metadata_path)?;
+        assert_eq!(metadata.title.as_deref(), Some("Backfilled paper"));
+        assert!(
+            fetcher
+                .pending_metadata
+                .lock()
+                .expect("pending set")
+                .is_empty(),
+            "backfilled paper must leave the pending set"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_self_heals_missing_metadata_without_redownloading_material() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let metadata_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let metadata_addr = metadata_listener.local_addr()?;
+        let material_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let material_addr = material_listener.local_addr()?;
+        let material_requests = Arc::new(AtomicUsize::new(0));
+        let material_server = spawn_material_server(material_listener, material_requests.clone());
+
+        let arxiv_id = "2401.55555";
+        let feed = atom_feed_for(arxiv_id, "Healed paper");
+        let metadata_server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = metadata_listener.accept().await else {
+                    break;
+                };
+                read_http_request(&mut stream).await.ok();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    feed.len(),
+                    feed
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{metadata_addr}/api/query");
+        fetcher.material_base_url = format!("http://{material_addr}");
+
+        // Simulate the aftermath of an outage: material cached, metadata not.
+        fetcher.rate_limiter.record_metadata_failure().await?;
+        fetcher.rate_limiter.record_metadata_failure().await?;
+        let first = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: arxiv_id.to_string(),
+                include_pdf: Some(true),
+                include_source: Some(true),
+                refresh: Some(false),
+            })
+            .await?;
+        assert!(first.metadata_pending);
+        let material_requests_after_first = material_requests.load(Ordering::SeqCst);
+        assert!(material_requests_after_first >= 2);
+
+        // arXiv recovers (pause expires).
+        fetcher.rate_limiter.record_metadata_recovery().await?;
+
+        let second = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: arxiv_id.to_string(),
+                include_pdf: Some(true),
+                include_source: Some(true),
+                refresh: Some(false),
+            })
+            .await?;
+
+        assert!(!second.metadata_pending);
+        assert_eq!(second.title.as_deref(), Some("Healed paper"));
+        let paths = PaperPaths::new(temp.path(), arxiv_id);
+        assert!(paths.metadata_path.exists());
+        assert_eq!(
+            material_requests.load(Ordering::SeqCst),
+            material_requests_after_first,
+            "self-heal must fetch only metadata, not re-download material"
+        );
+
+        metadata_server.abort();
+        material_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_still_fails_on_paper_specific_metadata_errors() -> Result<()> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        // 200 OK with a feed containing no entries: arXiv answered, the
+        // paper simply is not there. That is not an outage; the job fails.
+        let feed = r#"<feed xmlns="http://www.w3.org/2005/Atom"></feed>"#;
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                read_http_request(&mut stream).await.ok();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    feed.len(),
+                    feed
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+
+        let error = fetcher
+            .fetch(FetchPaperRequest {
+                arxiv_id: "2401.99999".to_string(),
+                include_pdf: Some(false),
+                include_source: Some(false),
+                refresh: Some(false),
+            })
+            .await
+            .expect_err("missing entry is a paper-specific failure");
+        assert!(
+            format!("{error:#}").contains("did not contain an entry"),
+            "{error:#}"
+        );
+
+        // A real answer from arXiv is a healthy service: no breaker trip.
+        let health = fetcher.metadata_health()?;
+        assert_eq!(health.failure_streak, 0);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_fails_fast_with_paused_error_and_zero_requests_while_breaker_open() -> Result<()>
+    {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server = spawn_hanging_metadata_server(listener, request_count.clone());
+
+        let temp = tempdir()?;
+        let mut fetcher = fetcher_without_rate_limit(temp.path())?;
+        fetcher.metadata_url = format!("http://{addr}/api/query");
+        fetcher.rate_limiter.record_metadata_failure().await?;
+        fetcher.rate_limiter.record_metadata_failure().await?;
+
+        let start = std::time::Instant::now();
+        let response = fetcher
+            .lookup(LookupPapersRequest {
+                arxiv_ids: vec!["2401.11111".to_string(), "2401.22222".to_string()],
+                fetch_missing_metadata: Some(true),
+                refresh_metadata: Some(false),
+            })
+            .await?;
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        for paper in &response.papers {
+            let error = paper.error.as_deref().expect("per-id paused error");
+            assert!(
+                error.contains("paused until"),
+                "error should explain the pause: {error}"
+            );
+        }
+
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_penalty_classifies_429_but_not_timeouts() {
+        let rate_limited = anyhow::anyhow!("arXiv metadata request failed: 429 Too Many Requests");
+        assert_eq!(rate_limit_penalty(&rate_limited), Some(RATE_LIMIT_PENALTY));
+
+        let timed_out = anyhow::anyhow!("arXiv metadata request timed out after 10s");
+        assert_eq!(rate_limit_penalty(&timed_out), None);
+
+        // "429" embedded in ids or timestamps must not draw a penalty.
+        let id_lookalike = anyhow::anyhow!("arXiv metadata response did not contain 2401.42900");
+        assert_eq!(rate_limit_penalty(&id_lookalike), None);
+
+        // A local paused short-circuit is not an arXiv answer, even though
+        // its timestamp could contain "429" by chance.
+        let paused = anyhow::Error::new(MetadataPausedError {
+            paused_until_unix_ms: 429_429_429,
+        });
+        assert_eq!(rate_limit_penalty(&paused), None);
+    }
+
+    #[test]
+    fn fetch_response_without_metadata_pending_field_still_parses() -> Result<()> {
+        // Wire compatibility: responses persisted by older arxd versions
+        // (finished-jobs file) lack the new field.
+        let old_json = r#"{
+            "arxiv_id": "2401.12345",
+            "cache_dir": "/tmp/cache",
+            "metadata_path": "/tmp/cache/metadata.json",
+            "metadata_db_path": "/tmp/cache/metadata.sqlite3",
+            "indexed_metadata_records": 1,
+            "pdf_path": null,
+            "source_archive_path": null,
+            "source_extracted_dir": null,
+            "citations_jsonl_path": null,
+            "title": null,
+            "authors": [],
+            "citation_count": 0,
+            "cache_hit": false,
+            "network_requests": 1,
+            "rate_limit_delay_seconds": 3
+        }"#;
+        let response: FetchPaperResponse = serde_json::from_str(old_json)?;
+        assert!(!response.metadata_pending);
         Ok(())
     }
 }

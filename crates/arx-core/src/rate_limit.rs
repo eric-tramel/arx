@@ -10,6 +10,16 @@ use std::{
 
 pub const ARXIV_DELAY: Duration = Duration::from_secs(3);
 
+/// Consecutive systemic metadata failures tolerated before metadata requests
+/// pause. One blip retries normally; a second consecutive failure means the
+/// service is degraded and further attempts only add load.
+pub const METADATA_PAUSE_THRESHOLD: u32 = 2;
+/// First metadata pause once the threshold is crossed; doubles per further
+/// consecutive failure.
+pub const METADATA_PAUSE_BASE: Duration = Duration::from_secs(30);
+/// Longest pause between metadata probes during an extended arXiv outage.
+pub const METADATA_PAUSE_MAX: Duration = Duration::from_secs(900);
+
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     lock_path: PathBuf,
@@ -17,9 +27,31 @@ pub struct RateLimiter {
     delay: Duration,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+/// On-disk state shared by every arx process. `next_allowed_unix_ms` gates
+/// all arXiv requests; the metadata fields track export.arxiv.org health so
+/// concurrent workers stop hammering a degraded metadata API instead of each
+/// discovering the outage independently.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RateLimitState {
     next_allowed_unix_ms: u64,
+    #[serde(default)]
+    metadata_failure_streak: u32,
+    #[serde(default)]
+    metadata_paused_until_unix_ms: u64,
+}
+
+/// Snapshot of shared arXiv metadata service health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetadataHealth {
+    pub failure_streak: u32,
+    pub paused_until_unix_ms: u64,
+}
+
+impl MetadataHealth {
+    /// The pause deadline, if metadata requests are currently paused.
+    pub fn paused_until(&self, now_unix_ms: u64) -> Option<u64> {
+        (self.paused_until_unix_ms > now_unix_ms).then_some(self.paused_until_unix_ms)
+    }
 }
 
 impl RateLimiter {
@@ -42,6 +74,26 @@ impl RateLimiter {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.run_with_penalty(request, |_| None).await
+    }
+
+    /// Run a request under the shared rate-limit lock. When the request fails
+    /// and `penalty_for_error` maps the error to a penalty, the shared
+    /// next-allowed time is pushed out BEFORE the lock is released, so no
+    /// other worker or process can start another request ahead of the
+    /// backoff. (Penalizing after release loses that race: a waiting worker
+    /// acquires the lock, sees the stale next-allowed time, and immediately
+    /// draws another 429 — observed live as paired 429s milliseconds apart.)
+    pub async fn run_with_penalty<F, Fut, T, P>(
+        &self,
+        request: F,
+        penalty_for_error: P,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+        P: FnOnce(&anyhow::Error) -> Option<Duration>,
+    {
         let guard = self.acquire().await?;
         let wait = guard.wait_duration()?;
         if !wait.is_zero() {
@@ -55,7 +107,14 @@ impl RateLimiter {
         }
 
         let result = request().await;
-        let release_result = guard.release();
+        let penalty_result = match &result {
+            Err(error) => match penalty_for_error(error) {
+                Some(penalty) => guard.extend_next_allowed(penalty),
+                None => Ok(()),
+            },
+            Ok(_) => Ok(()),
+        };
+        let release_result = guard.release().and(penalty_result);
         match (result, release_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(err)) => Err(err),
@@ -73,33 +132,84 @@ impl RateLimiter {
             .context("rate-limit lock task panicked")?
     }
 
-    /// Push the shared next-allowed time at least `penalty` into the future
-    /// so every arx process backs off — used when arXiv answers 429. Never
-    /// moves the next-allowed time earlier. Must not be called while this
-    /// process holds the rate-limit lock (i.e. from inside `run`'s closure).
-    pub async fn penalize(&self, penalty: Duration) -> Result<()> {
+    /// Lock-free read of shared metadata health; safe because state writes
+    /// are atomic renames. Callers use this to skip doomed metadata attempts
+    /// while the shared pause is active.
+    pub fn metadata_health(&self) -> Result<MetadataHealth> {
+        let state = read_state(&self.state_path)?;
+        Ok(MetadataHealth {
+            failure_streak: state.metadata_failure_streak,
+            paused_until_unix_ms: state.metadata_paused_until_unix_ms,
+        })
+    }
+
+    /// Record one systemic metadata failure (timeout, 429, 5xx, connect
+    /// error) in the shared state. Crossing `METADATA_PAUSE_THRESHOLD`
+    /// pauses metadata requests with exponential backoff so a degraded
+    /// arXiv sees a handful of probes instead of a retry storm. Must not be
+    /// called while this process holds the rate-limit lock.
+    pub async fn record_metadata_failure(&self) -> Result<MetadataHealth> {
         let lock_path = self.lock_path.clone();
         let state_path = self.state_path.clone();
         let delay = self.delay;
         tokio::task::spawn_blocking(move || {
             let guard = RateLimitGuard::acquire(lock_path, state_path.clone(), delay)?;
-            let state = read_state(&state_path)?;
-            let now = unix_ms()?;
-            let penalized = now.saturating_add(penalty.as_millis() as u64);
-            if penalized > state.next_allowed_unix_ms {
-                write_state(
-                    &state_path,
-                    &RateLimitState {
-                        next_allowed_unix_ms: penalized,
-                    },
-                )?;
-                tracing::info!(?penalty, "arXiv rate limited; extending shared backoff");
+            let mut state = read_state(&state_path)?;
+            state.metadata_failure_streak = state.metadata_failure_streak.saturating_add(1);
+            if state.metadata_failure_streak >= METADATA_PAUSE_THRESHOLD {
+                let paused_until = unix_ms()?.saturating_add(
+                    metadata_pause_for_streak(state.metadata_failure_streak).as_millis() as u64,
+                );
+                // Never shorten a pause another process already extended.
+                if paused_until > state.metadata_paused_until_unix_ms {
+                    state.metadata_paused_until_unix_ms = paused_until;
+                }
             }
+            let health = MetadataHealth {
+                failure_streak: state.metadata_failure_streak,
+                paused_until_unix_ms: state.metadata_paused_until_unix_ms,
+            };
+            write_state(&state_path, &state)?;
+            guard.release()?;
+            Ok(health)
+        })
+        .await
+        .context("metadata failure recording task panicked")?
+    }
+
+    /// Clear the shared metadata failure streak and pause after a metadata
+    /// request reaches arXiv and gets a real answer. Must not be called
+    /// while this process holds the rate-limit lock.
+    pub async fn record_metadata_recovery(&self) -> Result<()> {
+        // Fast path: nothing to clear, skip the lock entirely so the happy
+        // path stays write-free.
+        let state = read_state(&self.state_path)?;
+        if state.metadata_failure_streak == 0 && state.metadata_paused_until_unix_ms == 0 {
+            return Ok(());
+        }
+        let lock_path = self.lock_path.clone();
+        let state_path = self.state_path.clone();
+        let delay = self.delay;
+        tokio::task::spawn_blocking(move || {
+            let guard = RateLimitGuard::acquire(lock_path, state_path.clone(), delay)?;
+            let mut state = read_state(&state_path)?;
+            state.metadata_failure_streak = 0;
+            state.metadata_paused_until_unix_ms = 0;
+            write_state(&state_path, &state)?;
             guard.release()
         })
         .await
-        .context("rate-limit penalty task panicked")?
+        .context("metadata recovery recording task panicked")?
     }
+}
+
+/// Exponential pause schedule: 30s at the threshold, doubling per further
+/// consecutive failure, capped at 15 minutes.
+fn metadata_pause_for_streak(streak: u32) -> Duration {
+    let exponent = streak.saturating_sub(METADATA_PAUSE_THRESHOLD).min(16);
+    METADATA_PAUSE_BASE
+        .saturating_mul(1u32 << exponent.min(31))
+        .min(METADATA_PAUSE_MAX)
 }
 
 struct RateLimitGuard {
@@ -144,14 +254,25 @@ impl RateLimitGuard {
     }
 
     fn mark_started(&self) -> Result<()> {
+        let mut state = read_state(&self.state_path)?;
         let now = unix_ms()?;
-        let next_allowed_unix_ms = now.saturating_add(self.delay.as_millis() as u64);
-        write_state(
-            &self.state_path,
-            &RateLimitState {
-                next_allowed_unix_ms,
-            },
-        )
+        state.next_allowed_unix_ms = now.saturating_add(self.delay.as_millis() as u64);
+        write_state(&self.state_path, &state)
+    }
+
+    /// Push the shared next-allowed time at least `penalty` into the future.
+    /// Runs while this guard still holds the lock, so the extended backoff is
+    /// visible to the next acquirer before any new request can start.
+    fn extend_next_allowed(&self, penalty: Duration) -> Result<()> {
+        let mut state = read_state(&self.state_path)?;
+        let now = unix_ms()?;
+        let penalized = now.saturating_add(penalty.as_millis() as u64);
+        if penalized > state.next_allowed_unix_ms {
+            state.next_allowed_unix_ms = penalized;
+            write_state(&self.state_path, &state)?;
+            tracing::info!(?penalty, "arXiv rate limited; extending shared backoff");
+        }
+        Ok(())
     }
 
     fn release(mut self) -> Result<()> {
@@ -209,6 +330,12 @@ fn unix_ms() -> Result<u64> {
         .as_millis() as u64)
 }
 
+/// Current unix time in milliseconds, for callers comparing against shared
+/// deadlines like `MetadataHealth::paused_until`.
+pub fn now_unix_ms() -> Result<u64> {
+    unix_ms()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +358,7 @@ mod tests {
             &limiter.state_path,
             &RateLimitState {
                 next_allowed_unix_ms: unix_ms()?.saturating_add(60_000),
+                ..RateLimitState::default()
             },
         )?;
 
@@ -245,11 +373,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn penalize_extends_shared_backoff_without_shortening_it() -> Result<()> {
+    async fn run_with_penalty_extends_backoff_before_releasing_the_lock() -> Result<()> {
         let temp = tempdir()?;
         let limiter = RateLimiter::with_delay(temp.path(), Duration::ZERO);
 
-        limiter.penalize(Duration::from_secs(30)).await?;
+        let result: Result<()> = limiter
+            .run_with_penalty(
+                || async { Err(anyhow::anyhow!("simulated 429")) },
+                |error| {
+                    assert!(format!("{error:#}").contains("429"));
+                    Some(Duration::from_secs(30))
+                },
+            )
+            .await;
+        assert!(result.is_err());
+
+        // By the time run_with_penalty returns the penalty is already
+        // durable, so ANY later acquirer (the race in the old post-release
+        // penalize design) must observe it.
         let state = read_state(&limiter.state_path)?;
         let now = unix_ms()?;
         assert!(
@@ -258,9 +399,97 @@ mod tests {
         );
 
         // A smaller penalty must not move the next-allowed time earlier.
-        limiter.penalize(Duration::from_secs(1)).await?;
+        let result: Result<()> = limiter
+            .run_with_penalty(
+                || async { Err(anyhow::anyhow!("simulated 429")) },
+                |_| Some(Duration::from_secs(1)),
+            )
+            .await;
+        assert!(result.is_err());
         let state_after = read_state(&limiter.state_path)?;
-        assert_eq!(state_after.next_allowed_unix_ms, state.next_allowed_unix_ms);
+        assert!(state_after.next_allowed_unix_ms >= state.next_allowed_unix_ms);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_run_preserves_metadata_health_fields() -> Result<()> {
+        let temp = tempdir()?;
+        let limiter = RateLimiter::with_delay(temp.path(), Duration::from_millis(1));
+        write_state(
+            &limiter.state_path,
+            &RateLimitState {
+                next_allowed_unix_ms: 0,
+                metadata_failure_streak: 5,
+                metadata_paused_until_unix_ms: unix_ms()?.saturating_add(60_000),
+            },
+        )?;
+
+        limiter.run(|| async { Ok(()) }).await?;
+
+        let state = read_state(&limiter.state_path)?;
+        assert_eq!(
+            state.metadata_failure_streak, 5,
+            "mark_started must not wipe metadata health"
+        );
+        assert!(state.metadata_paused_until_unix_ms > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_failures_pause_after_threshold_with_exponential_backoff() -> Result<()> {
+        let temp = tempdir()?;
+        let limiter = RateLimiter::with_delay(temp.path(), Duration::ZERO);
+
+        let health = limiter.record_metadata_failure().await?;
+        assert_eq!(health.failure_streak, 1);
+        assert_eq!(
+            health.paused_until(unix_ms()?),
+            None,
+            "one failure should not pause metadata"
+        );
+
+        let health = limiter.record_metadata_failure().await?;
+        assert_eq!(health.failure_streak, 2);
+        let now = unix_ms()?;
+        let first_pause = health
+            .paused_until(now)
+            .expect("second failure should pause metadata");
+        assert!(first_pause >= now + 25_000 && first_pause <= now + 35_000);
+
+        let health = limiter.record_metadata_failure().await?;
+        let second_pause = health
+            .paused_until(unix_ms()?)
+            .expect("third failure should extend the pause");
+        assert!(
+            second_pause >= now + 55_000,
+            "pause should roughly double: {second_pause} vs {now}"
+        );
+
+        limiter.record_metadata_recovery().await?;
+        let health = limiter.metadata_health()?;
+        assert_eq!(health.failure_streak, 0);
+        assert_eq!(health.paused_until(unix_ms()?), None);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_pause_schedule_caps_at_max() {
+        assert_eq!(metadata_pause_for_streak(2), Duration::from_secs(30));
+        assert_eq!(metadata_pause_for_streak(3), Duration::from_secs(60));
+        assert_eq!(metadata_pause_for_streak(4), Duration::from_secs(120));
+        assert_eq!(metadata_pause_for_streak(7), METADATA_PAUSE_MAX);
+        assert_eq!(metadata_pause_for_streak(u32::MAX), METADATA_PAUSE_MAX);
+    }
+
+    #[test]
+    fn state_file_without_metadata_fields_still_parses() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("arxiv-rate-limit.json");
+        fs::write(&path, "{\"next_allowed_unix_ms\": 12}\n")?;
+        let state = read_state(&path)?;
+        assert_eq!(state.next_allowed_unix_ms, 12);
+        assert_eq!(state.metadata_failure_streak, 0);
+        assert_eq!(state.metadata_paused_until_unix_ms, 0);
         Ok(())
     }
 
