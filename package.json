@@ -1,6 +1,6 @@
 {
   "name": "@arx/agent-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Agent skills and MCP configuration for using arx with locally cached arXiv papers.",
   "license": "MIT",

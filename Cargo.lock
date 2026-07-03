@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "arx"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arx-core",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "arx-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "arx-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arx-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "arxd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arx-core",

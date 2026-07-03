@@ -75,11 +75,11 @@ The installers download the matching release archive and install `arx`, `arxd`, 
 Override defaults:
 
 ```bash
-ARX_VERSION=v0.1.1 ARX_INSTALL_DIR=$HOME/bin sh install.sh
+ARX_VERSION=v0.1.2 ARX_INSTALL_DIR=$HOME/bin sh install.sh
 ```
 
 ```powershell
-$env:ARX_VERSION = "v0.1.1"
+$env:ARX_VERSION = "v0.1.2"
 $env:ARX_INSTALL_DIR = "$HOME\\bin"
 .\\install.ps1
 ```
@@ -430,8 +430,8 @@ Distribution strategy: GitHub Releases plus tiny `install.sh` and `install.ps1` 
 Create a release:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 ## Development

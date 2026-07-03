@@ -132,7 +132,8 @@ jobs:
           gh release create "$TAG_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG_NAME" \
-            --notes "Prebuilt arx, arxd, and arx-mcp binaries for Linux x86_64, macOS arm64, and Windows x86_64."
+            --notes "Prebuilt arx, arxd, and arx-mcp binaries for Linux x86_64, macOS arm64, and Windows x86_64." \
+            --generate-notes
 
   tap-bump:
     name: Bump Homebrew tap formula

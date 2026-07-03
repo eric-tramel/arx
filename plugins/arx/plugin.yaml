@@ -1,6 +1,6 @@
 manifest_version: 1
 name: arx
-version: "0.1.1"
+version: "0.1.2"
 description: "Hermes integration for arx MCP paper metadata lookup, paper downloads, full-text search, and setup."
 author: "Eric Tramel"
 provides_commands:

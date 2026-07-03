@@ -1,6 +1,6 @@
 {
   "name": "arx",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "displayName": "arx",
   "description": "Claude Code plugin for using arx MCP and skills to work with locally cached arXiv papers.",
   "author": {
