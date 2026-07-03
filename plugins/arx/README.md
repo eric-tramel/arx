@@ -35,33 +35,32 @@ The MCP server exposes the existing four arx tools:
 
 ## Installation
 
-Use `/path/to/arx` as the path to the repository checkout that contains this plugin. It is not a path to an `arx-mcp` or `arxd` binary.
+Install `arx-mcp` and `arxd` first, then install this plugin from GitHub. You do not need an `arx` source checkout.
 
 Codex:
 
 ```sh
-codex plugin marketplace add /path/to/arx
+codex plugin marketplace add eric-tramel/arx --sparse .agents --sparse plugins/arx
 codex plugin add arx@arx
 ```
 
 Claude Code:
 
 ```sh
-claude plugin marketplace add /path/to/arx --scope local
-claude plugin install arx@arx --scope local
+claude plugin marketplace add eric-tramel/arx --scope user --sparse .claude-plugin plugins/arx
+claude plugin install arx@arx --scope user
 ```
 
 Pi:
 
 ```sh
-pi install /path/to/arx/plugins/arx -l --approve
+pi install git:github.com/eric-tramel/arx --approve
 ```
 
 Oh My Pi:
 
 ```sh
-cd /path/to/arx
-omp plugin link ./plugins/arx --local
+omp plugin install github:eric-tramel/arx
 ```
 
 Hermes:
@@ -71,5 +70,3 @@ hermes plugins install eric-tramel/arx/plugins/arx --enable
 hermes arx setup
 hermes mcp test arx
 ```
-
-`plugins/hermes-arx` is a symlink alias to this directory for older install instructions. Edit skills only under `plugins/arx/skills`.
