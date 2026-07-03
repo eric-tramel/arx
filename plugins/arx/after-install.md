@@ -7,4 +7,4 @@ hermes arx setup
 hermes mcp test arx
 ```
 
-The setup command registers the bundled launcher as `mcp_servers.arx`. The launcher resolves `arx-mcp` and `arxd` from installed binaries on `PATH`, exports `ARXD_BIN`, and starts `arx-mcp serve`.
+The setup command registers `arx-mcp serve` as `mcp_servers.arx`. Make sure the harness can find `arx-mcp` on `PATH`; `arx-mcp` will resolve `arxd` from `ARXD_BIN`, a sibling install, or `PATH`.

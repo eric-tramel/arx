@@ -15,7 +15,8 @@ except Exception:  # pragma: no cover - Hermes provides this at runtime.
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 MCP_SERVER_NAME = "arx"
-LAUNCHER = PLUGIN_DIR / "scripts" / "launch-arx-mcp.sh"
+MCP_COMMAND = "arx-mcp"
+MCP_ARGS = ["serve"]
 REQUIRED_MCP_TOOLS = {
     "lookup_arxiv_papers",
     "fetch_arxiv_paper",
@@ -80,14 +81,6 @@ def _handle_cli(args) -> None:
 
 def _setup_mcp(*, force: bool) -> dict[str, Any]:
     steps: list[dict[str, str]] = []
-    launcher_issue = _launcher_issue()
-    if launcher_issue:
-        return {
-            "ok": False,
-            "summary": "arx MCP setup needs attention.",
-            "steps": [{"status": "error", "message": launcher_issue}],
-        }
-
     state = _mcp_config_state()
     if _mcp_registration_ready(state) and not force:
         steps.append({"status": "ok", "message": "arx MCP is already configured."})
@@ -118,14 +111,6 @@ def _setup_mcp(*, force: bool) -> dict[str, Any]:
     }
 
 
-def _launcher_issue() -> str:
-    if not LAUNCHER.is_file():
-        return f"Missing launcher: {LAUNCHER}"
-    if not os.access(LAUNCHER, os.X_OK):
-        return f"Launcher is not executable: {LAUNCHER}"
-    return ""
-
-
 def _write_mcp_registration() -> dict[str, Any]:
     try:
         config = _load_config_data()
@@ -136,8 +121,8 @@ def _write_mcp_registration() -> dict[str, Any]:
             servers = {}
             config["mcp_servers"] = servers
         servers[MCP_SERVER_NAME] = {
-            "command": str(LAUNCHER),
-            "args": [],
+            "command": MCP_COMMAND,
+            "args": MCP_ARGS,
             "enabled": True,
         }
         _save_config_data(config)
@@ -240,12 +225,7 @@ def _tool_filter_issue(tools: Any) -> str:
 
 
 def _is_expected_mcp_launch(command: Any, args: list[str]) -> bool:
-    if args:
-        return False
-    try:
-        return Path(str(command)).resolve() == LAUNCHER.resolve()
-    except OSError:
-        return False
+    return str(command) == MCP_COMMAND and args == MCP_ARGS
 
 
 def _mcp_registration_ready(state: dict[str, Any]) -> bool:
@@ -266,7 +246,8 @@ def _mcp_registration_problem(state: dict[str, Any]) -> str:
     if not state["enabled"]:
         return f"`mcp_servers.{MCP_SERVER_NAME}` is disabled."
     if not state["expected"]:
-        return f"`mcp_servers.{MCP_SERVER_NAME}` does not launch `{LAUNCHER}`. {state['detail']}"
+        expected = " ".join([MCP_COMMAND, *MCP_ARGS])
+        return f"`mcp_servers.{MCP_SERVER_NAME}` does not launch `{expected}`. {state['detail']}"
     if state["tool_filter_issue"]:
         return state["tool_filter_issue"]
     return ""

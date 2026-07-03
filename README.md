@@ -302,9 +302,15 @@ arx-mcp install-claude-desktop --config-path /path/to/claude_desktop_config.json
 
 ## Agent plugin installation
 
-The agent plugins do not install `arx`. Install `arx`, `arxd`, and `arx-mcp` first with Homebrew, a release installer, or `cargo install`, then make sure `arx-mcp` and `arxd` are on `PATH` from the same install directory.
+The agent plugins do not install `arx`. Install `arx`, `arxd`, and `arx-mcp` first with Homebrew, a release installer, or `cargo install`, then make sure the agent harness can find `arx-mcp` on `PATH`.
 
-The plugin-managed MCP launcher is supported on Unix, macOS, and Linux. It resolves installed `arx-mcp` and `arxd` binaries from `PATH`, exports `ARXD_BIN`, and runs `arx-mcp serve`. It rejects binaries from the current project directory or any Git worktree so an agent harness does not accidentally launch a checkout build such as `target/debug/arx-mcp`.
+The plugin MCP config launches:
+
+```bash
+arx-mcp serve
+```
+
+`arx-mcp` resolves `arxd` itself, using `ARXD_BIN` when set, a sibling `arxd` next to the running `arx-mcp` binary when present, or `arxd` from `PATH`. You do not need an `arx` source checkout to install or use these plugins.
 
 The commands below install the agent plugin from GitHub. You do not need an `arx` source checkout.
 
@@ -342,7 +348,7 @@ hermes arx setup
 hermes mcp test arx
 ```
 
-Windows users should configure MCP manually with `arx-mcp print-config`; the plugin launcher is POSIX shell based.
+If a harness cannot inherit your shell `PATH`, configure it manually with the absolute-path snippet from `arx-mcp print-config`.
 
 ## Cache layout
 

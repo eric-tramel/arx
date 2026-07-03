@@ -44,7 +44,6 @@ def main() -> int:
         validate_drift,
         validate_mcp_configs,
         validate_no_machine_paths,
-        validate_launcher_behavior,
         validate_hermes_plugin,
         validate_mcp_smoke,
     ]
@@ -120,23 +119,16 @@ def validate_drift() -> None:
             raise ValidationError(f"{alias.relative_to(ROOT)} must be a symlink")
         if alias.resolve() != target.resolve():
             raise ValidationError(f"{alias.relative_to(ROOT)} does not point at {target.relative_to(ROOT)}")
-    inline = load_json(ROOT / "plugins/arx/.mcp.json")["mcpServers"]["arx"]["args"][2]
-    script = (ROOT / "plugins/arx/scripts/launch-arx-mcp.sh").read_text(encoding="utf-8")
-    if inline != script:
-        raise ValidationError("plugins/arx/.mcp.json inline launcher drifted from launch-arx-mcp.sh")
 
 
 def validate_mcp_configs() -> None:
     codex_mcp = load_json(ROOT / "plugins/arx/.mcp.json")["mcpServers"]["arx"]
-    if codex_mcp.get("command") != "/bin/sh":
-        raise ValidationError("plugins/arx/.mcp.json must launch through /bin/sh")
-    args = codex_mcp.get("args")
-    if not isinstance(args, list) or len(args) != 3 or "ARXD_BIN" not in args[2] or "arx-mcp" not in args[2]:
-        raise ValidationError("plugins/arx/.mcp.json does not contain the inline arx launcher")
+    if codex_mcp.get("command") != "arx-mcp" or codex_mcp.get("args") != ["serve"]:
+        raise ValidationError("plugins/arx/.mcp.json must launch `arx-mcp serve`")
 
     claude_mcp = load_json(ROOT / "plugins/arx/.claude-mcp.json")["mcpServers"]["arx"]
-    if claude_mcp.get("command") != "${CLAUDE_PLUGIN_ROOT}/scripts/launch-arx-mcp.sh":
-        raise ValidationError("plugins/arx/.claude-mcp.json must use the Claude plugin root launcher")
+    if claude_mcp.get("command") != "arx-mcp" or claude_mcp.get("args") != ["serve"]:
+        raise ValidationError("plugins/arx/.claude-mcp.json must launch `arx-mcp serve`")
 
     codex_market = load_json(ROOT / ".agents/plugins/marketplace.json")
     codex_plugins = codex_market.get("plugins")
@@ -170,118 +162,6 @@ def validate_no_machine_paths() -> None:
                 raise ValidationError(f"{path}: contains machine-specific marker {marker!r}")
 
 
-def validate_launcher_behavior() -> None:
-    launcher = ROOT / "plugins/arx/scripts/launch-arx-mcp.sh"
-    run_checked(["sh", "-n", str(launcher)], cwd=ROOT)
-
-    for label, command in launcher_commands():
-        validate_launcher_matrix(label, command)
-
-
-def validate_launcher_matrix(label: str, command: list[str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="arx-plugin-launcher-") as tmp:
-        base = Path(tmp)
-        work = base / "work"
-        work.mkdir()
-        good_bin = base / "good-bin"
-        good_bin.mkdir()
-        write_fake_binary(
-            good_bin / "arx-mcp",
-            "printf 'args=%s\\n' \"$*\"\nprintf 'ARXD_BIN=%s\\n' \"${ARXD_BIN:-}\"\n",
-        )
-        write_fake_binary(good_bin / "arxd", "printf 'arxd fake\\n'\n")
-
-        result = run_launcher_command(command, cwd=work, path=path_value(good_bin))
-        assert_returncode(result, 0, f"{label}: trusted fake binaries should launch")
-        if f"ARXD_BIN={(good_bin / 'arxd').resolve()}" not in result.stdout:
-            raise ValidationError(f"{label}: launcher did not export ARXD_BIN to arx-mcp")
-        if "args=serve" not in result.stdout:
-            raise ValidationError(f"{label}: launcher did not exec arx-mcp with serve")
-
-        only_arxd = base / "only-arxd"
-        only_arxd.mkdir()
-        write_fake_binary(only_arxd / "arxd", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=work, path=path_value(only_arxd)),
-            127,
-            f"{label}: missing arx-mcp should exit 127",
-        )
-
-        only_mcp = base / "only-mcp"
-        only_mcp.mkdir()
-        write_fake_binary(only_mcp / "arx-mcp", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=work, path=path_value(only_mcp)),
-            127,
-            f"{label}: missing arxd should exit 127",
-        )
-
-        rel_work = base / "relative-work"
-        rel_work.mkdir()
-        rel_bin = rel_work / "relbin"
-        rel_bin.mkdir()
-        write_fake_binary(rel_bin / "arx-mcp", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=rel_work, path=f"relbin:{path_value(good_bin)}"),
-            126,
-            f"{label}: relative PATH hit should exit 126",
-        )
-
-        empty_work = base / "empty-work"
-        empty_work.mkdir()
-        write_fake_binary(empty_work / "arx-mcp", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=empty_work, path=f":{path_value(good_bin)}"),
-            126,
-            f"{label}: empty PATH hit should exit 126",
-        )
-
-        project = base / "project"
-        project_bin = project / "bin"
-        project_bin.mkdir(parents=True)
-        write_fake_binary(project_bin / "arx-mcp", "exit 0\n")
-        write_fake_binary(project_bin / "arxd", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=project, path=path_value(project_bin)),
-            126,
-            f"{label}: project-local binaries should exit 126",
-        )
-
-        gitroot = base / "gitroot"
-        git_bin = gitroot / "out" / "bin"
-        git_bin.mkdir(parents=True)
-        (gitroot / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
-        write_fake_binary(git_bin / "arx-mcp", "exit 0\n")
-        write_fake_binary(git_bin / "arxd", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=work, path=path_value(git_bin)),
-            126,
-            f"{label}: Git worktree binaries should exit 126",
-        )
-
-        link_bin = base / "link-bin"
-        link_bin.mkdir()
-        (link_bin / "arx-mcp").symlink_to(git_bin / "arx-mcp")
-        write_fake_binary(link_bin / "arxd", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=work, path=path_value(link_bin)),
-            126,
-            f"{label}: symlink into Git worktree should exit 126",
-        )
-
-        bin1 = base / "bin1"
-        bin2 = base / "bin2"
-        bin1.mkdir()
-        bin2.mkdir()
-        write_fake_binary(bin1 / "arx-mcp", "exit 0\n")
-        write_fake_binary(bin2 / "arxd", "exit 0\n")
-        assert_returncode(
-            run_launcher_command(command, cwd=work, path=f"{path_value(bin1)}:{path_value(bin2)}"),
-            126,
-            f"{label}: mismatched binary directories should exit 126",
-        )
-
-
 def validate_hermes_plugin() -> None:
     module = import_hermes_plugin()
     ctx = FakeHermesContext()
@@ -305,8 +185,8 @@ def validate_hermes_plugin() -> None:
                     {
                         "mcp_servers": {
                             "arx": {
-                                "command": str(module.LAUNCHER),
-                                "args": [],
+                                "command": module.MCP_COMMAND,
+                                "args": module.MCP_ARGS,
                                 "enabled": True,
                                 "tools": {"include": ["full_text_search"]},
                             }
@@ -336,7 +216,6 @@ def validate_mcp_smoke() -> None:
     if not arx_mcp.is_file() or not arxd.is_file():
         raise ValidationError("cargo build did not produce arx-mcp and arxd")
 
-    launcher = ROOT / "plugins/arx/scripts/launch-arx-mcp.sh"
     with tempfile.TemporaryDirectory(prefix="arx-mcp-smoke-") as tmp:
         base = Path(tmp)
         bin_dir = base / "bin"
@@ -356,7 +235,7 @@ def validate_mcp_smoke() -> None:
         env["ARXD_IDLE_SHUTDOWN_MS"] = "150"
 
         proc = subprocess.Popen(
-            [str(launcher)],
+            ["arx-mcp", "serve"],
             cwd=work,
             env=env,
             stdin=subprocess.PIPE,
@@ -511,48 +390,9 @@ def parse_skill_frontmatter(path: Path) -> dict[str, str]:
     raise ValidationError(f"{path}: unterminated YAML frontmatter")
 
 
-def write_fake_binary(path: Path, body: str) -> None:
-    path.write_text("#!/bin/sh\nset -eu\n" + body, encoding="utf-8")
-    make_executable(path)
-
-
 def make_executable(path: Path) -> None:
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-
-def path_value(*entries: Path) -> str:
-    return os.pathsep.join(str(entry) for entry in entries)
-
-
-def launcher_commands() -> list[tuple[str, list[str]]]:
-    inline = load_json(ROOT / "plugins/arx/.mcp.json")["mcpServers"]["arx"]
-    return [
-        ("script", [str(ROOT / "plugins/arx/scripts/launch-arx-mcp.sh")]),
-        ("inline", [inline["command"], *inline["args"]]),
-    ]
-
-
-def run_launcher_command(command: list[str], *, cwd: Path, path: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PATH"] = path
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-
-
-def assert_returncode(result: subprocess.CompletedProcess[str], expected: int, label: str) -> None:
-    if result.returncode != expected:
-        raise ValidationError(
-            f"{label}: expected return code {expected}, got {result.returncode}. "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
-        )
 
 
 def run_checked(command: list[str], *, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess[str]:
