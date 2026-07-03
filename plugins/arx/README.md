@@ -63,3 +63,13 @@ Oh My Pi:
 cd /path/to/arx
 omp plugin link ./plugins/arx --local
 ```
+
+Hermes:
+
+```sh
+hermes plugins install eric-tramel/arx/plugins/arx --enable
+hermes arx setup
+hermes mcp test arx
+```
+
+`plugins/hermes-arx` is a symlink alias to this directory for older install instructions. Edit skills only under `plugins/arx/skills`.

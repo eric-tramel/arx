@@ -73,7 +73,7 @@ def validate_versions() -> None:
     codex = load_json(ROOT / "plugins/arx/.codex-plugin/plugin.json")
     claude = load_json(ROOT / "plugins/arx/.claude-plugin/plugin.json")
     package = load_json(ROOT / "plugins/arx/package.json")
-    hermes = parse_top_level_yaml(ROOT / "plugins/hermes-arx/plugin.yaml")
+    hermes = parse_top_level_yaml(ROOT / "plugins/arx/plugin.yaml")
 
     for name, version in [
         ("codex plugin", codex.get("version")),
@@ -86,27 +86,28 @@ def validate_versions() -> None:
 
 
 def validate_skills() -> None:
-    for root in [ROOT / "plugins/arx/skills", ROOT / "plugins/hermes-arx/skills"]:
-        seen: set[str] = set()
-        for skill in sorted(root.glob("*/SKILL.md")):
-            frontmatter = parse_skill_frontmatter(skill)
-            name = frontmatter.get("name")
-            description = frontmatter.get("description")
-            if name != skill.parent.name:
-                raise ValidationError(f"{skill}: frontmatter name {name!r} does not match directory")
-            if not description:
-                raise ValidationError(f"{skill}: missing description")
-            seen.add(str(name))
-        if seen != SKILL_NAMES:
-            raise ValidationError(f"{root}: expected skills {sorted(SKILL_NAMES)}, found {sorted(seen)}")
+    root = ROOT / "plugins/arx/skills"
+    seen: set[str] = set()
+    for skill in sorted(root.glob("*/SKILL.md")):
+        frontmatter = parse_skill_frontmatter(skill)
+        name = frontmatter.get("name")
+        description = frontmatter.get("description")
+        if name != skill.parent.name:
+            raise ValidationError(f"{skill}: frontmatter name {name!r} does not match directory")
+        if not description:
+            raise ValidationError(f"{skill}: missing description")
+        seen.add(str(name))
+    if seen != SKILL_NAMES:
+        raise ValidationError(f"{root}: expected skills {sorted(SKILL_NAMES)}, found {sorted(seen)}")
 
 
 def validate_drift() -> None:
-    compare_trees(ROOT / "plugins/arx/skills", ROOT / "plugins/hermes-arx/skills")
-    compare_files(
-        ROOT / "plugins/arx/scripts/launch-arx-mcp.sh",
-        ROOT / "plugins/hermes-arx/scripts/launch-arx-mcp.sh",
-    )
+    hermes_alias = ROOT / "plugins/hermes-arx"
+    canonical_plugin = ROOT / "plugins/arx"
+    if not hermes_alias.is_symlink():
+        raise ValidationError("plugins/hermes-arx must be a symlink to the canonical plugin")
+    if hermes_alias.resolve() != canonical_plugin.resolve():
+        raise ValidationError("plugins/hermes-arx does not point at plugins/arx")
     inline = load_json(ROOT / "plugins/arx/.mcp.json")["mcpServers"]["arx"]["args"][2]
     script = (ROOT / "plugins/arx/scripts/launch-arx-mcp.sh").read_text(encoding="utf-8")
     if inline != script:
@@ -426,7 +427,7 @@ class FakeHermesContext:
 
 
 def import_hermes_plugin() -> Any:
-    path = ROOT / "plugins/hermes-arx/__init__.py"
+    path = ROOT / "plugins/arx/__init__.py"
     spec = importlib.util.spec_from_file_location("arx_hermes_plugin_validation", path)
     if spec is None or spec.loader is None:
         raise ValidationError("Could not load Hermes plugin module")
@@ -494,20 +495,6 @@ def parse_skill_frontmatter(path: Path) -> dict[str, str]:
         key, value = line.split(":", 1)
         values[key.strip()] = value.strip()
     raise ValidationError(f"{path}: unterminated YAML frontmatter")
-
-
-def compare_trees(left: Path, right: Path) -> None:
-    left_files = sorted(path.relative_to(left) for path in left.rglob("*") if path.is_file())
-    right_files = sorted(path.relative_to(right) for path in right.rglob("*") if path.is_file())
-    if left_files != right_files:
-        raise ValidationError(f"tree drift between {left} and {right}")
-    for rel in left_files:
-        compare_files(left / rel, right / rel)
-
-
-def compare_files(left: Path, right: Path) -> None:
-    if left.read_bytes() != right.read_bytes():
-        raise ValidationError(f"file drift between {left} and {right}")
 
 
 def write_fake_binary(path: Path, body: str) -> None:

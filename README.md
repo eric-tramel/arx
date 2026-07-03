@@ -338,10 +338,12 @@ omp plugin link ./plugins/arx --local
 Hermes:
 
 ```bash
-hermes plugins install eric-tramel/arx/plugins/hermes-arx --enable
+hermes plugins install eric-tramel/arx/plugins/arx --enable
 hermes arx setup
 hermes mcp test arx
 ```
+
+`plugins/hermes-arx` remains a symlink alias to the same plugin for older install notes, but new installs should target `plugins/arx`.
 
 Windows users should configure MCP manually with `arx-mcp print-config`; the plugin launcher is POSIX shell based.
 
