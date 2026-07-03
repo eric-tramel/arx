@@ -57,9 +57,11 @@ def main() -> int:
 
 def validate_json_manifests() -> None:
     for path in [
+        ROOT / "package.json",
         ROOT / "plugins/arx/.codex-plugin/plugin.json",
         ROOT / "plugins/arx/.claude-plugin/plugin.json",
         ROOT / "plugins/arx/package.json",
+        ROOT / ".mcp.json",
         ROOT / "plugins/arx/.mcp.json",
         ROOT / "plugins/arx/.claude-mcp.json",
         ROOT / ".agents/plugins/marketplace.json",
@@ -72,17 +74,23 @@ def validate_versions() -> None:
     cargo_version = workspace_version()
     codex = load_json(ROOT / "plugins/arx/.codex-plugin/plugin.json")
     claude = load_json(ROOT / "plugins/arx/.claude-plugin/plugin.json")
+    root_package = load_json(ROOT / "package.json")
     package = load_json(ROOT / "plugins/arx/package.json")
     hermes = parse_top_level_yaml(ROOT / "plugins/arx/plugin.yaml")
 
     for name, version in [
         ("codex plugin", codex.get("version")),
         ("claude plugin", claude.get("version")),
+        ("root Pi/OMP package", root_package.get("version")),
         ("Pi/OMP package", package.get("version")),
         ("hermes plugin", hermes.get("version")),
     ]:
         if version != cargo_version:
             raise ValidationError(f"{name} version {version!r} does not match Cargo version {cargo_version!r}")
+
+    pi_manifest = root_package.get("pi")
+    if not isinstance(pi_manifest, dict) or pi_manifest.get("skills") != ["plugins/arx/skills"]:
+        raise ValidationError("root package.json must expose plugins/arx/skills for Pi remote installs")
 
 
 def validate_skills() -> None:
@@ -102,12 +110,16 @@ def validate_skills() -> None:
 
 
 def validate_drift() -> None:
-    hermes_alias = ROOT / "plugins/hermes-arx"
-    canonical_plugin = ROOT / "plugins/arx"
-    if not hermes_alias.is_symlink():
-        raise ValidationError("plugins/hermes-arx must be a symlink to the canonical plugin")
-    if hermes_alias.resolve() != canonical_plugin.resolve():
-        raise ValidationError("plugins/hermes-arx does not point at plugins/arx")
+    symlinks = [
+        (ROOT / "plugins/hermes-arx", ROOT / "plugins/arx"),
+        (ROOT / "skills", ROOT / "plugins/arx/skills"),
+        (ROOT / ".mcp.json", ROOT / "plugins/arx/.mcp.json"),
+    ]
+    for alias, target in symlinks:
+        if not alias.is_symlink():
+            raise ValidationError(f"{alias.relative_to(ROOT)} must be a symlink")
+        if alias.resolve() != target.resolve():
+            raise ValidationError(f"{alias.relative_to(ROOT)} does not point at {target.relative_to(ROOT)}")
     inline = load_json(ROOT / "plugins/arx/.mcp.json")["mcpServers"]["arx"]["args"][2]
     script = (ROOT / "plugins/arx/scripts/launch-arx-mcp.sh").read_text(encoding="utf-8")
     if inline != script:
@@ -140,6 +152,8 @@ def validate_mcp_configs() -> None:
 def validate_no_machine_paths() -> None:
     forbidden = ["/Users/eric", "target/debug"]
     for path in list((ROOT / "plugins").rglob("*")) + [
+        ROOT / "package.json",
+        ROOT / ".mcp.json",
         ROOT / ".agents/plugins/marketplace.json",
         ROOT / ".claude-plugin/marketplace.json",
     ]:

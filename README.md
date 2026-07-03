@@ -306,33 +306,32 @@ The agent plugins do not install `arx`. Install `arx`, `arxd`, and `arx-mcp` fir
 
 The plugin-managed MCP launcher is supported on Unix, macOS, and Linux. It resolves installed `arx-mcp` and `arxd` binaries from `PATH`, exports `ARXD_BIN`, and runs `arx-mcp serve`. It rejects binaries from the current project directory or any Git worktree so an agent harness does not accidentally launch a checkout build such as `target/debug/arx-mcp`.
 
-Use `/path/to/arx` below as the path to this repository checkout, not a path to an `arx` binary.
+The commands below install the agent plugin from GitHub. You do not need an `arx` source checkout.
 
 Codex:
 
 ```bash
-codex plugin marketplace add /path/to/arx
+codex plugin marketplace add eric-tramel/arx --sparse .agents --sparse plugins/arx
 codex plugin add arx@arx
 ```
 
 Claude Code:
 
 ```bash
-claude plugin marketplace add /path/to/arx --scope local
-claude plugin install arx@arx --scope local
+claude plugin marketplace add eric-tramel/arx --scope user --sparse .claude-plugin plugins/arx
+claude plugin install arx@arx --scope user
 ```
 
 Pi:
 
 ```bash
-pi install /path/to/arx/plugins/arx -l --approve
+pi install git:github.com/eric-tramel/arx --approve
 ```
 
 Oh My Pi:
 
 ```bash
-cd /path/to/arx
-omp plugin link ./plugins/arx --local
+omp plugin install github:eric-tramel/arx
 ```
 
 Hermes:
@@ -342,8 +341,6 @@ hermes plugins install eric-tramel/arx/plugins/arx --enable
 hermes arx setup
 hermes mcp test arx
 ```
-
-`plugins/hermes-arx` remains a symlink alias to the same plugin for older install notes, but new installs should target `plugins/arx`.
 
 Windows users should configure MCP manually with `arx-mcp print-config`; the plugin launcher is POSIX shell based.
 
