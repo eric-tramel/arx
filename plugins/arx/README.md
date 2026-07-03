@@ -10,6 +10,8 @@ This plugin vendors Agent Skills and MCP configuration for using `arx` from Code
 
 Windows users can still configure MCP manually with `arx-mcp print-config`.
 
+This plugin does not install `arx`; install the binaries first with Homebrew, a release installer, or `cargo install`.
+
 ## Skills
 
 - `arx-paper-metadata`: inspect arXiv metadata, abstracts, readiness, and cache paths.
@@ -33,6 +35,8 @@ The MCP server exposes the existing four arx tools:
 
 ## Installation
 
+Use `/path/to/arx` as the path to the repository checkout that contains this plugin. It is not a path to an `arx-mcp` or `arxd` binary.
+
 Codex:
 
 ```sh
@@ -50,7 +54,7 @@ claude plugin install arx@arx --scope local
 Pi:
 
 ```sh
-pi install /path/to/arx/plugins/arx -l
+pi install /path/to/arx/plugins/arx -l --approve
 ```
 
 Oh My Pi:

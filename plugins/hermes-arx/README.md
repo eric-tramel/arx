@@ -2,6 +2,8 @@
 
 This plugin gives Hermes the same arx guidance that the Codex, Claude Code, Pi, and Oh My Pi plugin root bundles, while keeping paper operations in the `arx-mcp` MCP server.
 
+Install `arx-mcp` and `arxd` first. The plugin setup writes Hermes MCP config that launches the bundled plugin script, and that script resolves installed `arx-mcp` and `arxd` binaries from `PATH`.
+
 Install from this repository:
 
 ```bash
