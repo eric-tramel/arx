@@ -1,0 +1,31 @@
+{
+  "name": "arx",
+  "owner": {
+    "name": "Eric Tramel",
+    "email": "eric.tramel@gmail.com"
+  },
+  "description": "arx plugins and skills for agent harnesses that work with locally cached arXiv papers.",
+  "plugins": [
+    {
+      "name": "arx",
+      "displayName": "arx",
+      "source": "./plugins/arx",
+      "description": "Skills and MCP configuration for using arx to inspect, fetch, and search locally cached arXiv papers.",
+      "author": {
+        "name": "Eric Tramel",
+        "email": "eric.tramel@gmail.com"
+      },
+      "homepage": "https://github.com/eric-tramel/arx",
+      "repository": "https://github.com/eric-tramel/arx",
+      "license": "MIT",
+      "category": "Developer Tools",
+      "tags": [
+        "arx",
+        "arxiv",
+        "mcp",
+        "papers",
+        "research"
+      ]
+    }
+  ]
+}
